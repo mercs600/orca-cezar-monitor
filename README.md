@@ -8,16 +8,40 @@ never changes anything there.
   (30 by default) and after a dropped connection. Changes arrive on the cockpit's event stream
   (`GET /p/<project>/events`): new runs, steps, endings, deletions.
 - **Status bar:** `Cezar 🔴 1 🟢 2` - unseen problems and running runs; a click reloads.
-- **Panel** (right sidebar, robot icon), *Projekty* tab: cockpit → project → tasks. A project
-  collapses; it turns red with a problem (a failed run with its gate's failure line, a run asking a
-  question, an account usage limit, a gate being retried, a worktree that needs attention, a read
-  error) and green while something runs. A click on a task opens the run in the cockpit; ✓ next to
-  "Problemy" marks them as seen.
+- **Panel** (right sidebar, robot icon), laid out like Orca's activity list: cockpit → project →
+  tasks. A project is a collapsible group whose dot turns red with a problem (a failed run with its
+  gate's failure line, a run asking a question, an account usage limit, a gate being retried, a
+  worktree that needs attention, a read error) and green while something runs; ✓ marks its problems
+  as seen. Each task shows the cockpit's step dots (done, running, failed, pending) with its place in
+  the workflow, e.g. `5/14 · <step>`; a click opens the run in the cockpit.
 - **Desktop notifications** on a new failed run, a question and a usage-limit hold.
+
+## Install
+
+Needs Orca 1.4.252 or newer (`orca plugin install` is missing in older builds - update Orca first).
+
+```sh
+orca plugin install mercs600/orca-cezar-monitor@v0.4.0   # a release; leave out @v0.4.0 for the latest main
+```
+
+Orca lists the access the plugin asks for - its own Node.js worker, its own storage, settings and
+encrypted secrets, desktop notifications - and runs nothing until you approve it and turn it on in
+Settings → Plugins. It installs as `mercs600.cezar-monitor`; `orca plugin update` brings newer
+releases.
+
+From a clone instead (development):
+
+```sh
+git clone https://github.com/mercs600/orca-cezar-monitor
+orca plugin dev load ./orca-cezar-monitor                         # prints the access and a fingerprint
+orca plugin dev load ./orca-cezar-monitor --approve <fingerprint>
+```
+
+Then open the **Cezar** panel (robot icon in the right sidebar) and add your cockpit.
 
 ## Setup
 
-The panel's *Ustawienia* tab: add a cockpit, pick the projects to follow, save a login. Or Orca
+In the panel, the ⚙ in its header: add a cockpit, pick the projects to follow, save a login. Or Orca
 Settings → Cezar → "Cockpits", one cockpit per line:
 
 ```
