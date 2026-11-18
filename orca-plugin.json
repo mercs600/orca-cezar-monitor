@@ -1,0 +1,90 @@
+{
+  "manifestVersion": 2,
+  "id": "cezar-monitor",
+  "name": "Cezar",
+  "version": "0.3.0",
+  "description": "Follows the projects of one or more Cezar cockpits live: what is running now and whether anything failed.",
+  "repository": "https://github.com/mercs600/orca-cezar-monitor",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "cezar-monitor",
+        "title": "Cezar",
+        "icon": "bot",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "commands": [
+      {
+        "id": "cezar.refresh",
+        "title": "Cezar: reload now"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "cezar-status",
+        "text": "Cezar",
+        "icon": "bot",
+        "tooltip": "Cezar - loading",
+        "command": "cezar.refresh"
+      }
+    ],
+    "settings": [
+      {
+        "key": "cockpits",
+        "title": "Cockpits",
+        "type": "string",
+        "multiline": true,
+        "default": "",
+        "placeholder": "https://cezar.example.com:4443 web-app, api",
+        "description": "One cockpit per line: its address, optionally followed by comma-separated projects (none = every project). Login: netrc (~/.config/cezar/netrc, ~/.netrc), the keychain item cezar:<host>, or one saved in the panel."
+      },
+      {
+        "key": "fullRefreshMinutes",
+        "title": "Full reload every (min)",
+        "type": "integer",
+        "default": 30,
+        "minimum": 5,
+        "maximum": 240,
+        "description": "Changes arrive live from the cockpit's event stream; the full run list (large) is fetched only this often and after the stream drops."
+      },
+      {
+        "key": "windowHours",
+        "title": "Failure window (h)",
+        "type": "integer",
+        "default": 24,
+        "minimum": 1,
+        "maximum": 168,
+        "description": "Failed runs that ended within this time are shown as problems."
+      },
+      {
+        "key": "notify",
+        "title": "Desktop notifications",
+        "type": "boolean",
+        "default": true,
+        "description": "On a new failed run, a run asking a question, and a run held by an account usage limit."
+      }
+    ]
+  },
+  "capabilities": [
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "settings:own"
+    },
+    {
+      "kind": "secrets:own"
+    },
+    {
+      "kind": "notifications:show"
+    }
+  ]
+}
