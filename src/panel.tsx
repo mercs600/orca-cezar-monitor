@@ -19,16 +19,15 @@ import {
   shell,
   Spinner,
   Stack,
-  Tab,
-  Tabs,
   Text,
   update,
-  type OrcaNode,
   type PanelContext,
   type Tone,
 } from 'orca'
 import {
   projectCounts,
+  type Progress,
+  type StepVisual,
   refLabel,
   type CockpitSnapshot,
   type LiveRun,
@@ -91,13 +90,15 @@ const PROBLEM_LABEL: Record<Problem['kind'], string> = {
   attention: 'worktree do uwagi',
 }
 
-/** One task: a coloured dot, the title as a link to the run in the cockpit, then the links to its
- *  issue and merge request and one line of detail. */
+/** One task, laid out like an entry of Orca's activity list: a status dot, the title (wrapping),
+ *  the time on the right, a muted line of detail, then the issue and MR links as its footer. The
+ *  row opens the run; Orca allows nothing pressable inside a ListItem, so the links sit under it. */
 function Entry({
   tone,
   title,
   url,
   meta,
+  time,
   issueUrl,
   mrUrl,
   issueNumber,
@@ -105,32 +106,33 @@ function Entry({
   issueTitle,
   mrTitle,
   summary,
+  progress,
 }: {
-  project: string
-  issueTitle?: string | null
-  mrTitle?: string | null
-  summary?: string
+  progress?: Progress | null
   tone: Tone
   title: string
   url: string
   meta: string
+  time: string
+  project: string
   issueUrl?: string | null
   mrUrl?: string | null
   issueNumber?: number | null
+  issueTitle?: string | null
+  mrTitle?: string | null
+  summary?: string
 }) {
   const issue = refLabel(issueUrl, issueNumber, project)
   const mr = refLabel(mrUrl, null, project)
   // The issue's (or MR's) own title says what the run is about; Cezar's summary says what it does.
   const heading = issueTitle ?? mrTitle ?? title
-  const detail = heading !== title && summary ? `${summary} · ${meta}` : meta
+  const detail = (heading !== title && summary ? [summary, meta] : [meta]).filter(Boolean).join(' · ')
   const hasLinks = Boolean((issue && issueUrl) || (mr && mrUrl))
-  // The whole row (dot, title, detail) is one press target that opens the run. Orca allows no
-  // pressable control inside a ListItem, so the issue and MR links sit just under it.
   return (
     <Stack gap="none">
       <List label={heading}>
         <ListItem onPress={() => open(url)}>
-          <Box direction="row" gap="xs" align="start">
+          <Box direction="row" gap="sm" align="start">
             <Box shrink={false}>
               <Text tone={tone} size="sm">
                 ●
@@ -138,7 +140,19 @@ function Entry({
             </Box>
             <Box grow minWidth={0}>
               <Stack gap="none">
-                <Text size="sm">{heading}</Text>
+                <Box direction="row" gap="sm" align="start" justify="between">
+                  <Box grow minWidth={0}>
+                    <Text size="sm" weight="semibold">
+                      {heading}
+                    </Text>
+                  </Box>
+                  <Box shrink={false}>
+                    <Text size="xs" muted>
+                      {time}
+                    </Text>
+                  </Box>
+                </Box>
+                {progress ? <Steps progress={progress} /> : null}
                 <Text size="xs" muted truncate>
                   {detail}
                 </Text>
@@ -148,15 +162,17 @@ function Entry({
         </ListItem>
       </List>
       {hasLinks ? (
-        <Box paddingX="lg">
+        // The footer starts under the title, as the branch line of an Orca activity entry does.
+        <Box direction="row">
+          <Box width={LINK_INDENT} shrink={false} />
           <Row gap="sm" wrap>
             {issue && issueUrl ? (
-              <Text size="xs">
+              <Text size="xs" muted>
                 <Link onPress={() => open(issueUrl)}>{`📋 ${issue}`}</Link>
               </Text>
             ) : null}
             {mr && mrUrl ? (
-              <Text size="xs">
+              <Text size="xs" muted>
                 <Link onPress={() => open(mrUrl)}>{`🔀 ${mr}`}</Link>
               </Text>
             ) : null}
@@ -167,59 +183,54 @@ function Entry({
   )
 }
 
+const STEP_TONE: Record<StepVisual, Tone | undefined> = {
+  done: 'success',
+  active: 'warning',
+  failed: 'danger',
+  pending: undefined,
+}
+
+/** The cockpit's step dots: one per workflow step, then "3/14" and the step's name. */
+function Steps({ progress }: { progress: Progress }) {
+  return (
+    <Text size="xs" truncate>
+      {progress.steps.map((v) =>
+        STEP_TONE[v] ? (
+          <Text size="xs" tone={STEP_TONE[v]}>
+            ●
+          </Text>
+        ) : (
+          <Text size="xs" muted>
+            ●
+          </Text>
+        ),
+      )}
+      <Text size="xs" muted>{`  ${progress.at}/${progress.steps.length} · ${progress.name}`}</Text>
+    </Text>
+  )
+}
+
+/** Left offset of an entry's links, in pixels: the ListItem padding plus the status dot column. */
+const LINK_INDENT = 28
+
 function runMeta(run: LiveRun): string {
-  const since = run.startedAt != null ? `od ${clock(run.startedAt)}` : ''
   const parts =
     run.status === 'queued'
       ? ['w kolejce', run.workflow]
       : run.status === 'waiting'
-        ? ['czeka na odpowiedź', run.step, since]
-        : [`${run.step}${run.attempt > 1 ? ` (próba ${run.attempt})` : ''}`, since]
+        ? ['czeka na odpowiedź', run.step]
+        : [
+            run.progress
+              ? run.attempt > 1
+                ? `próba ${run.attempt}`
+                : ''
+              : `${run.step}${run.attempt > 1 ? ` (próba ${run.attempt})` : ''}`,
+          ]
   return parts.filter(Boolean).join(' · ')
 }
 
-/** The project's counters as the same coloured dots the task rows use: red problems, green
- *  running, yellow waiting for an answer, grey queued. */
-function Counters({ p, problems }: { p: ProjectSnapshot; problems: number }) {
-  if (!p.ok) {
-    return (
-      <Text size="sm" tone="danger">
-        ● błąd odczytu
-      </Text>
-    )
-  }
-  const n = (status: LiveRun['status']) => p.live.filter((r) => r.status === status).length
-  const parts: [Tone, number][] = [
-    ['danger', problems],
-    ['success', n('running')],
-    ['warning', n('waiting')],
-    ['neutral', n('queued')],
-  ]
-  return (
-    <Row gap="sm">
-      {parts
-        .filter(([, k]) => k > 0)
-        .map(([tone, k]) => (
-          <Text size="sm">
-            <Text tone={tone}>●</Text>
-            {` ${k}`}
-          </Text>
-        ))}
-    </Row>
-  )
-}
-
-function GroupLabel({ text, action }: { text: string; action?: OrcaNode }) {
-  return (
-    <Row justify="between">
-      <Text size="xs" muted weight="semibold">
-        {text}
-      </Text>
-      {action ?? null}
-    </Row>
-  )
-}
-
+/** A project as a group of Orca's activity list: chevron, name in small capitals, a status dot,
+ *  the task count on the right; its tasks under it, problems first. */
 function ProjectNode({
   cockpit,
   p,
@@ -230,99 +241,109 @@ function ProjectNode({
   dismissed: Set<string>
 }) {
   const c = projectCounts(p, dismissed)
-  const tone: Tone | undefined = !p.ok || c.problems ? 'danger' : c.live ? 'success' : undefined
+  const tone: Tone = !p.ok || c.problems ? 'danger' : c.live ? 'success' : 'neutral'
   const key = `${cockpit.host}/${p.project}`
   const isOpen = read(opened)[key] ?? Boolean(c.problems || c.live)
   const problems = p.problems.filter((x) => !dismissed.has(x.key))
-  const toggle = () => update(opened, (o) => ({ ...o, [key]: !isOpen }))
+  const total = problems.length + p.live.length
   return (
-    <Box background={tone ?? 'none'} border={tone ?? 'neutral'} radius="md" paddingX="sm" paddingY="xs">
-      <List label={p.project}>
-        <ListItem icon={isOpen ? 'collapse' : 'expand'} onPress={toggle}>
-          <Row gap="sm">
-            <Text size="sm" weight="semibold">
-              {p.project}
-            </Text>
-            <Counters p={p} problems={c.problems} />
-          </Row>
-        </ListItem>
-      </List>
+    <Stack gap="none">
+      <Box direction="row" align="center" gap="xs">
+        <Box grow minWidth={0}>
+          <List label={p.project}>
+            <ListItem
+              icon={isOpen ? 'collapse' : 'expand'}
+              onPress={() => update(opened, (o) => ({ ...o, [key]: !isOpen }))}
+            >
+              <Box direction="row" gap="sm" align="center" justify="between">
+                <Row gap="xs">
+                  <Text tone={tone} size="xs">
+                    ●
+                  </Text>
+                  <Text size="xs" muted weight="semibold">
+                    {p.project.toUpperCase()}
+                  </Text>
+                </Row>
+                <Text size="xs" muted>
+                  {!p.ok ? 'błąd' : String(total)}
+                </Text>
+              </Box>
+            </ListItem>
+          </List>
+        </Box>
+        {problems.length ? (
+          <Box shrink={false}>
+            <IconButton
+              icon="check"
+              label="Oznacz problemy jako przejrzane"
+              size="xs"
+              variant="ghost"
+              onPress={() => call(plugin.request('cezar.dismiss', { keys: problems.map((x) => x.key) }))}
+            />
+          </Box>
+        ) : null}
+      </Box>
       {isOpen ? (
-        <Box paddingX="sm" paddingY="xs">
-          <Stack gap="sm">
-            {!p.ok ? (
+        <Stack gap="sm">
+          {!p.ok ? (
+            <Box paddingX="lg">
               <Text size="xs" tone="danger">
                 {p.error}
               </Text>
-            ) : null}
-            {problems.length ? (
-              <Stack gap="none">
-                <GroupLabel
-                  text={`Problemy · ${problems.length}`}
-                  action={
-                    <IconButton
-                      icon="check"
-                      label="Oznacz jako przejrzane"
-                      size="xs"
-                      variant="ghost"
-                      onPress={() => call(plugin.request('cezar.dismiss', { keys: problems.map((x) => x.key) }))}
-                    />
-                  }
-                />
-                {problems.map((x) => (
-                  <Entry
-                    project={p.project}
-                    tone={PROBLEM_TONE[x.kind]}
-                    title={x.title}
-                    url={x.url}
-                    issueUrl={x.issueUrl}
-                    mrUrl={x.mrUrl}
-                    issueNumber={x.issueNumber}
-                    issueTitle={x.issueTitle}
-                    mrTitle={x.mrTitle}
-                    summary={x.summary}
-                    meta={[PROBLEM_LABEL[x.kind], clock(x.at), x.detail].filter(Boolean).join(' · ')}
-                  />
-                ))}
-              </Stack>
-            ) : null}
-            {p.live.length ? (
-              <Stack gap="none">
-                <GroupLabel text={`W toku · ${p.live.length}`} />
-                {p.live.map((run) => (
-                  <Entry
-                    project={p.project}
-                    tone={RUN_DOT[run.status]}
-                    title={run.title}
-                    url={run.url}
-                    meta={runMeta(run)}
-                    issueUrl={run.issueUrl}
-                    mrUrl={run.mrUrl}
-                    issueNumber={run.issueNumber}
-                    issueTitle={run.issueTitle}
-                    mrTitle={run.mrTitle}
-                    summary={run.summary}
-                  />
-                ))}
-              </Stack>
-            ) : null}
-            {p.ok && !problems.length && !p.live.length ? (
+            </Box>
+          ) : null}
+          {problems.map((x) => (
+            <Entry
+              project={p.project}
+              tone={PROBLEM_TONE[x.kind]}
+              title={x.title}
+              url={x.url}
+              time={clock(x.at)}
+              meta={[PROBLEM_LABEL[x.kind], x.detail].filter(Boolean).join(' · ')}
+              issueUrl={x.issueUrl}
+              mrUrl={x.mrUrl}
+              issueNumber={x.issueNumber}
+              issueTitle={x.issueTitle}
+              mrTitle={x.mrTitle}
+              summary={x.summary}
+              progress={x.progress}
+            />
+          ))}
+          {p.live.map((run) => (
+            <Entry
+              project={p.project}
+              tone={RUN_DOT[run.status]}
+              title={run.title}
+              url={run.url}
+              time={clock(run.startedAt)}
+              meta={runMeta(run)}
+              issueUrl={run.issueUrl}
+              mrUrl={run.mrUrl}
+              issueNumber={run.issueNumber}
+              issueTitle={run.issueTitle}
+              mrTitle={run.mrTitle}
+              summary={run.summary}
+              progress={run.progress}
+            />
+          ))}
+          {p.ok && !problems.length && !p.live.length ? (
+            <Box paddingX="lg" paddingY="xs">
               <Text size="xs" muted>
                 {p.doneInWindow ? `Nic nie leci · ${p.doneInWindow} ukończonych w oknie` : 'Nic nie leci'}
               </Text>
-            ) : null}
-          </Stack>
-        </Box>
+            </Box>
+          ) : null}
+        </Stack>
       ) : null}
-    </Box>
+    </Stack>
   )
 }
 
-function CockpitNode({ c, many, dismissed }: { c: CockpitSnapshot; many: boolean; dismissed: Set<string> }) {
+function CockpitNode({ c, dismissed }: { c: CockpitSnapshot; dismissed: Set<string> }) {
   return (
     <Stack gap="xs">
       <Row justify="between">
-        <Text size="xs" muted weight="semibold" tone={c.error ? 'danger' : undefined} truncate>
+        <Text size="xs" muted tone={c.error ? 'danger' : undefined} truncate>
           {c.host}
         </Text>
         <IconButton
@@ -461,6 +482,8 @@ export default function Panel() {
   const dismissed = new Set(s.dismissed)
   const cockpits = snap?.cockpits ?? []
   const live = cockpits.every((c) => c.streaming)
+  // No cockpit yet: open on the settings, where one is added.
+  const settingsOpen = read(tab) === 'settings' || cockpits.length === 0
   return (
     <Stack gap="sm">
       {err ? (
@@ -468,40 +491,41 @@ export default function Panel() {
           {err}
         </Text>
       ) : null}
-      <Tabs label="Widok" value={read(tab)} onChange={(v) => set(tab, v)}>
-        <Tab value="projects" label="Projekty" icon="activity">
-          <Stack gap="sm">
-            <Row justify="between">
-              <Text muted size="xs">
-                <Text tone={live ? 'success' : 'warning'}>●</Text>
-                {live ? ' na żywo' : ' łączę…'}
-              </Text>
-              <Row gap="xs">
-                {s.loading ? <Spinner label="Ładuję" labelHidden /> : null}
-                <IconButton
-                  icon="refresh"
-                  label="Przeładuj wszystko"
-                  size="xs"
-                  variant="ghost"
-                  onPress={() => call(plugin.request('cezar.refresh'))}
-                />
-              </Row>
-            </Row>
-            {cockpits.length ? (
-              cockpits.map((c) => <CockpitNode c={c} many={cockpits.length > 1} dismissed={dismissed} />)
-            ) : (
-              <EmptyState
-                title="Brak kokpitu"
-                description="Dodaj adres kokpitu Cezar w zakładce Ustawienia."
-                icon="cloud"
-              />
-            )}
-          </Stack>
-        </Tab>
-        <Tab value="settings" label="Ustawienia" icon="settings">
-          <Settings s={s} />
-        </Tab>
-      </Tabs>
+      {/* Like Orca's own sidebar modules: a header with icon actions, no tabs. */}
+      <Row justify="between">
+        <Text muted size="xs">
+          <Text tone={live ? 'success' : 'warning'}>●</Text>
+          {live ? ' na żywo' : ' łączę…'}
+        </Text>
+        <Row gap="xs">
+          {s.loading ? <Spinner label="Ładuję" labelHidden /> : null}
+          <IconButton
+            icon="refresh"
+            label="Przeładuj wszystko"
+            size="xs"
+            variant="ghost"
+            onPress={() => call(plugin.request('cezar.refresh'))}
+          />
+          <IconButton
+            icon={settingsOpen ? 'close' : 'settings'}
+            label={settingsOpen ? 'Zamknij ustawienia' : 'Ustawienia'}
+            size="xs"
+            variant="ghost"
+            onPress={() => set(tab, settingsOpen ? 'projects' : 'settings')}
+          />
+        </Row>
+      </Row>
+      {settingsOpen ? (
+        <Settings s={s} />
+      ) : cockpits.length ? (
+        <Stack gap="md">
+          {cockpits.map((c) => (
+            <CockpitNode c={c} dismissed={dismissed} />
+          ))}
+        </Stack>
+      ) : (
+        <EmptyState title="Brak kokpitu" description="Dodaj adres kokpitu Cezar w ustawieniach (⚙)." icon="cloud" />
+      )}
     </Stack>
   )
 }

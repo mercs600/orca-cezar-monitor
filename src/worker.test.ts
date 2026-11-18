@@ -90,6 +90,31 @@ function fakeCockpits(cockpits: Record<string, Cockpit>): Fake {
 const settle = (ms = 600) => new Promise((r) => setTimeout(r, ms))
 const now = () => new Date().toISOString()
 const get = async (w: { request(n: string): Promise<unknown> }) => (await w.request('cezar.get')) as MonitorState
+/** Polls the worker's state until `ok` holds (or 5 s pass, then answers the last state): the
+ *  worker works on its own timers, child processes and streams, so a fixed wait is flaky. */
+async function until(
+  w: { request(n: string): Promise<unknown> },
+  ok: (s: MonitorState) => boolean,
+  ms = 5000
+): Promise<MonitorState> {
+  const end = Date.now() + ms
+  let s = await get(w)
+  while (!ok(s) && Date.now() < end) {
+    await settle(50)
+    s = await get(w)
+  }
+  return s
+}
+/** Waits until the last status bar text is `text` (or 5 s pass). */
+async function barText(host: ReturnType<typeof mockHost>, text: string): Promise<{ text: string; tone: string }> {
+  const end = Date.now() + 5000
+  const last = () => (host.callsOf('statusBar.update').at(-1) ?? { text: '', tone: '' }) as { text: string; tone: string }
+  while (last().text !== text && Date.now() < end) {
+    await settle(50)
+  }
+  return last()
+}
+const firstProject = (s: MonitorState) => s.snapshot?.cockpits[0]?.projects[0]
 
 test('loads each watched project once, then follows its event stream', async () => {
   const fake = fakeCockpits({
@@ -114,8 +139,7 @@ test('loads each watched project once, then follows its event stream', async () 
     secrets: { 'login:a.example': 'user', 'password:a.example': 'pw' }
   })
   const worker = await mount(host)
-  await settle()
-  let s = await get(worker)
+  let s = await until(worker, (x) => Boolean(x.snapshot?.cockpits[0]?.streaming && firstProject(x)?.problems[0]?.detail.includes('jest')))
   const c = s.snapshot!.cockpits[0]
   assert.deepEqual(c.available, ['app', 'other'])
   assert.equal(c.credentialSource, 'plugin')
@@ -132,11 +156,10 @@ test('loads each watched project once, then follows its event stream', async () 
     startedAt: now(),
     steps: [{ id: 'impl', name: 'Implement', status: 'running' }]
   })
-  await settle()
-  s = await get(worker)
+  s = await until(worker, (x) => Boolean(firstProject(x)?.live[0]))
   assert.equal(s.snapshot!.cockpits[0].projects[0].live[0].step, 'Implement')
   assert.equal(fake.calls.filter((x) => x.includes('/p/app/runs ')).length, 1, 'the full list is read once, not polled')
-  const bar = host.callsOf('statusBar.update').at(-1) as { text: string; tone: string }
+  const bar = await barText(host, 'Cezar 🔴 1 🟢 1')
   assert.equal(bar.text, 'Cezar 🔴 1 🟢 1')
   assert.equal(bar.tone, 'danger')
   // First look seeds what is already broken: no notification for it.
@@ -149,13 +172,13 @@ test('a run started after the first load appears from the stream, and leaves on 
   const fake = fakeCockpits({ 'a.example:4443': { projects: ['app'], runs: { app: [] } } })
   const host = mockHost({ settings: { cockpits: 'https://a.example:4443' } })
   const worker = await mount(host)
-  await settle()
+  await until(worker, (x) => Boolean(x.snapshot?.cockpits[0]?.streaming))
   fake.push('a.example:4443', 'app', { id: 'new-1', title: 'świeże zadanie', status: 'queued', createdAt: now() })
-  await settle()
-  assert.equal((await get(worker)).snapshot!.cockpits[0].projects[0].live[0]?.id, 'new-1')
+  let s = await until(worker, (x) => Boolean(firstProject(x)?.live[0]))
+  assert.equal(firstProject(s)?.live[0]?.id, 'new-1')
   fake.send('a.example:4443', 'app', 'event: run-deleted\ndata: {"id":"new-1"}\n\n')
-  await settle()
-  assert.equal((await get(worker)).snapshot!.cockpits[0].projects[0].live.length, 0)
+  s = await until(worker, (x) => firstProject(x)?.live.length === 0)
+  assert.equal(firstProject(s)?.live.length, 0)
   await worker.deactivate()
 })
 
@@ -163,9 +186,13 @@ test('a failure arriving on the stream is notified once; dismissing clears the c
   const fake = fakeCockpits({ 'a.example:4443': { projects: ['app'], runs: { app: [] } } })
   const host = mockHost({ settings: { cockpits: 'https://a.example:4443' }, secrets: { 'login:a.example': 'u', 'password:a.example': 'p' } })
   const worker = await mount(host)
-  await settle()
+  await until(worker, (x) => Boolean(x.snapshot?.cockpits[0]?.streaming))
   fake.push('a.example:4443', 'app', { id: 'r3', title: 'nowy', status: 'failed', finishedAt: now(), error: 'boom' })
-  await settle()
+  await until(worker, (x) => Boolean(firstProject(x)?.problems[0]))
+  const end = Date.now() + 5000
+  while (!host.callsOf('notifications.show').length && Date.now() < end) {
+    await settle(50)
+  }
   fake.push('a.example:4443', 'app', { id: 'r3', title: 'nowy', status: 'failed', finishedAt: now(), error: 'boom' })
   await settle()
   const shown = host.callsOf('notifications.show') as { title: string }[]
@@ -173,7 +200,7 @@ test('a failure arriving on the stream is notified once; dismissing clears the c
   assert.ok(shown[0].title.includes('nowy'))
   const s = (await worker.request('cezar.dismiss', { keys: ['r3:failed'] })) as MonitorState
   assert.deepEqual(s.dismissed, ['r3:failed'])
-  const bar = host.callsOf('statusBar.update').at(-1) as { text: string; tone: string }
+  const bar = await barText(host, 'Cezar')
   assert.equal(bar.text, 'Cezar')
   await worker.deactivate()
 })
@@ -188,13 +215,12 @@ test('several cockpits: each with its own login; one refusing does not hide the 
     secrets: { 'login:a.example': 'ua', 'password:a.example': 'pa', 'login:b.example': 'ub', 'password:b.example': 'bad' }
   })
   const worker = await mount(host)
-  await settle()
-  const s = await get(worker)
+  const s = await until(worker, (x) => Boolean(x.snapshot?.cockpits[0]?.projects[0]?.live.length && x.snapshot?.cockpits[1]?.error))
   const [a, b] = s.snapshot!.cockpits
   assert.equal(a.projects[0].live.length, 1)
   assert.ok(b.error?.startsWith('401'))
   assert.ok(fake.calls.some((x) => x.startsWith('b.example:4443/api/v1/projects ub:bad')))
-  const bar = host.callsOf('statusBar.update').at(-1) as { text: string; tone: string }
+  const bar = await barText(host, 'Cezar 🔴 1 🟢 1')
   assert.equal(bar.text, 'Cezar 🔴 1 🟢 1')
   await worker.deactivate()
 })
@@ -203,7 +229,7 @@ test('a project picked in the panel is written to the cockpits setting', async (
   fakeCockpits({ 'a.example:4443': { projects: ['app', 'api'], runs: {} } })
   const host = mockHost({ settings: { cockpits: 'https://a.example:4443' } })
   const worker = await mount(host)
-  await settle()
+  await until(worker, (x) => Boolean(x.snapshot?.cockpits[0]?.available.length))
   await worker.request('cezar.setProjects', { cockpit: 'https://a.example:4443', projects: ['api'] })
   assert.equal(host.data().settings.cockpits, 'https://a.example:4443 api')
   await worker.deactivate()

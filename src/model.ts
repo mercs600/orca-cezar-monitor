@@ -33,6 +33,12 @@ export type Run = {
   worktreeLifecycle?: { needsAttention?: boolean; phase?: string; state?: string } | null
 }
 
+/** A workflow step as the cockpit draws it: one dot per step. */
+export type StepVisual = 'done' | 'active' | 'failed' | 'pending'
+
+/** Where a run is in its workflow: every step's visual, and the step it is on (1-based). */
+export type Progress = { steps: StepVisual[]; at: number; name: string }
+
 export type LiveRun = {
   id: string
   title: string
@@ -53,6 +59,7 @@ export type LiveRun = {
   mrTitle?: string | null
   /** Cezar's own short summary of the run, without the leading issue number. */
   summary?: string
+  progress?: Progress | null
 }
 
 export type ProblemKind = 'failed' | 'held' | 'retrying' | 'waiting' | 'attention'
@@ -75,6 +82,7 @@ export type Problem = {
   mrTitle?: string | null
   /** Cezar's own short summary of the run, without the leading issue number. */
   summary?: string
+  progress?: Progress | null
 }
 
 export type ProjectSnapshot = {
@@ -137,6 +145,35 @@ export function currentStep(r: Run): Step | undefined {
     steps.find((s) => s.status === 'running') ??
     steps.filter((s) => s.status !== 'pending').at(-1)
   )
+}
+
+const VISUAL: Record<string, StepVisual> = {
+  done: 'done',
+  skipped: 'done',
+  running: 'active',
+  waiting: 'active',
+  failed: 'failed'
+}
+
+/** The run's workflow as the cockpit's step dots: done green, the running step yellow, a failed one
+ *  red, the rest grey; `at` is the step the cockpit names (running, else the first pending one). */
+export function progressOf(r: Run): Progress | null {
+  const steps = r.steps ?? []
+  if (!steps.length) {
+    return null
+  }
+  const visuals = steps.map((st) => VISUAL[st.status] ?? 'pending')
+  let at = visuals.indexOf('active')
+  if (at < 0) {
+    at = visuals.lastIndexOf('failed')
+  }
+  if (at < 0) {
+    at = visuals.indexOf('pending')
+  }
+  if (at < 0) {
+    at = steps.length - 1
+  }
+  return { steps: visuals, at: at + 1, name: steps[at].name ?? steps[at].id }
 }
 
 /** The step a failed run stopped on. */
@@ -214,7 +251,8 @@ export function summarize(runs: Run[], o: SummarizeOptions): ProjectSnapshot {
         url: base.url,
         issueUrl: base.issueUrl,
         mrUrl: base.mrUrl,
-        summary: base.summary
+        summary: base.summary,
+        progress: progressOf(r)
       })
       if (r.status === 'waiting') {
         problems.push({
@@ -262,7 +300,8 @@ export function summarize(runs: Run[], o: SummarizeOptions): ProjectSnapshot {
         key: `${r.id}:failed`,
         kind: 'failed',
         detail: `${step ? `${step}: ` : ''}${o.reasons?.[r.id] ?? r.error ?? 'failed'}`,
-        at: finished
+        at: finished,
+        progress: progressOf(r)
       })
     } else if (r.worktreeLifecycle?.needsAttention) {
       problems.push({

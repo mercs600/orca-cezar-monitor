@@ -3,6 +3,7 @@ import { assert, test } from 'orca/testing'
 import {
   counts,
   keepOwnForge,
+  progressOf,
   refLabel,
   failureLine,
   failureReason,
@@ -233,4 +234,29 @@ test('forge refs: work items and issues read as issues, merge requests as MRs', 
     iid: '3',
   })
   assert.equal(parseRef('https://git.example/a/m'), undefined)
+})
+
+test('progress: one visual per step, at the running step, or where it failed', () => {
+  const p = progressOf({
+    id: 'x',
+    status: 'running',
+    steps: [
+      { id: 'a', status: 'done' },
+      { id: 'b', status: 'skipped' },
+      { id: 'c', name: 'Gate C', status: 'running' },
+      { id: 'd', status: 'pending' },
+    ],
+  })
+  assert.deepEqual(p, { steps: ['done', 'done', 'active', 'pending'], at: 3, name: 'Gate C' })
+  const f = progressOf({
+    id: 'y',
+    status: 'failed',
+    steps: [
+      { id: 'a', status: 'done' },
+      { id: 'b', status: 'failed' },
+      { id: 'c', status: 'pending' },
+    ],
+  })
+  assert.deepEqual(f, { steps: ['done', 'failed', 'pending'], at: 2, name: 'b' })
+  assert.equal(progressOf({ id: 'z', status: 'queued' }), null)
 })
