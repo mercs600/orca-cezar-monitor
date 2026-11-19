@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "cezar-monitor",
   "name": "Cezar",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Follows the projects of one or more Cezar cockpits live: what is running now and whether anything failed.",
   "repository": "https://github.com/mercs600/orca-cezar-monitor",
   "engines": {

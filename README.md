@@ -35,7 +35,7 @@ never changes anything there.
 Needs Orca 1.4.252 or newer (`orca plugin install` is missing in older builds - update Orca first).
 
 ```sh
-orca plugin install mercs600/orca-cezar-monitor@v0.4.0   # a release; leave out @v0.4.0 for the latest main
+orca plugin install mercs600/orca-cezar-monitor@v0.5.0   # a release; leave out @v0.5.0 for the latest main
 ```
 
 Orca lists the access the plugin asks for - its own Node.js worker, its own storage, settings and
