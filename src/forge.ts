@@ -53,17 +53,27 @@ export function cliAvailable(forge: Forge): Promise<boolean> {
   return available[forge]
 }
 
-/** The REST call that answers the title: GitLab issues and MRs; GitHub's issues endpoint, which
- *  answers for pull requests too. */
+/** The REST call that answers the title (and an MR's source branch): GitLab issues and MRs,
+ *  GitHub issues and pull requests. */
 export function titleCall(ref: ForgeRef): string[] {
   if (ref.forge === 'gitlab') {
     const kind = ref.kind === 'change' ? 'merge_requests' : 'issues'
     return ['api', '--hostname', ref.host, `projects/${encodeURIComponent(ref.path)}/${kind}/${ref.iid}`]
   }
-  return ['api', '--hostname', ref.host, `repos/${ref.path}/issues/${ref.iid}`]
+  return ['api', '--hostname', ref.host, `repos/${ref.path}/${ref.kind === 'change' ? 'pulls' : 'issues'}/${ref.iid}`]
 }
 
-export function fetchTitle(ref: ForgeRef): Promise<string | null> {
+/** What the forge says of an issue or MR: its title, and for an MR its source branch. */
+export type ForgeInfo = { title: string | null; branch: string | null }
+
+/** Reads the forge's answer: GitLab `title` + `source_branch`, GitHub `title` + `head.ref`. */
+export function forgeInfo(json: unknown): ForgeInfo {
+  const o = (json ?? {}) as { title?: unknown; source_branch?: unknown; head?: { ref?: unknown } }
+  const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : null)
+  return { title: str(o.title), branch: str(o.source_branch) ?? str(o.head?.ref) }
+}
+
+export function fetchTitle(ref: ForgeRef): Promise<ForgeInfo | null> {
   return new Promise((resolve) => {
     execFile(CLI[ref.forge], titleCall(ref), { timeout: 15_000, encoding: 'utf8' }, (err, stdout) => {
       if (err) {
@@ -71,8 +81,34 @@ export function fetchTitle(ref: ForgeRef): Promise<string | null> {
         return
       }
       try {
-        const title = (JSON.parse(stdout) as { title?: unknown }).title
-        resolve(typeof title === 'string' && title.trim() ? title.trim() : null)
+        resolve(forgeInfo(JSON.parse(stdout)))
+      } catch {
+        resolve(null)
+      }
+    })
+  })
+}
+
+/** The merge requests GitLab relates to an issue (it lists the ones that mention or close it), so a
+ *  run that recorded only an MR number can be matched to the MR's URL. GitHub: not looked up. */
+export function fetchRelatedMrs(ref: ForgeRef): Promise<{ iid: number; url: string }[] | null> {
+  if (ref.forge !== 'gitlab' || ref.kind !== 'issue') {
+    return Promise.resolve(null)
+  }
+  const api = `projects/${encodeURIComponent(ref.path)}/issues/${ref.iid}/related_merge_requests`
+  return new Promise((resolve) => {
+    execFile(CLI.gitlab, ['api', '--hostname', ref.host, api], { timeout: 15_000, encoding: 'utf8' }, (err, stdout) => {
+      if (err) {
+        resolve(null)
+        return
+      }
+      try {
+        const list = JSON.parse(stdout) as { iid?: unknown; web_url?: unknown }[]
+        resolve(
+          list
+            .filter((m) => typeof m.iid === 'number' && typeof m.web_url === 'string')
+            .map((m) => ({ iid: m.iid as number, url: m.web_url as string }))
+        )
       } catch {
         resolve(null)
       }

@@ -24,6 +24,10 @@ export type Run = {
   issueNumber?: number | null
   prNumber?: number | null
   pullRequestUrl?: string | null
+  /** The MRs the run opened or continued; a continued one often carries its number only. */
+  prRefs?: { number?: number; url?: string }[] | null
+  /** MR URLs Cezar picked out of the run's text and issue. */
+  referencedPrCandidates?: string[] | null
   referencedIssueUrl?: string | null
   currentStepId?: string | null
   error?: string | null
@@ -57,6 +61,10 @@ export type LiveRun = {
   /** Titles of that issue and merge request, from GitLab. */
   issueTitle?: string | null
   mrTitle?: string | null
+  /** The main MR's source branch, which names it better than `!3`. */
+  mrBranch?: string | null
+  /** Other merge requests the run touched, after the main one (`mrsOf`). */
+  moreMrs?: MrRef[]
   /** Cezar's own short summary of the run, without the leading issue number. */
   summary?: string
   progress?: Progress | null
@@ -80,10 +88,40 @@ export type Problem = {
   /** Titles of that issue and merge request, from GitLab. */
   issueTitle?: string | null
   mrTitle?: string | null
+  /** The main MR's source branch, which names it better than `!3`. */
+  mrBranch?: string | null
+  /** Other merge requests the run touched, after the main one (`mrsOf`). */
+  moreMrs?: MrRef[]
   /** Cezar's own short summary of the run, without the leading issue number. */
   summary?: string
   progress?: Progress | null
 }
+
+/** A run that ended - done or cancelled - within the window, for the "Zakończone" list. */
+export type FinishedRun = {
+  id: string
+  title: string
+  status: 'done' | 'cancelled'
+  finishedAt: number | null
+  /** How long it ran, from start to end. */
+  durationMs: number | null
+  issueNumber: number | null
+  prNumber: number | null
+  url: string
+  issueUrl?: string | null
+  mrUrl?: string | null
+  issueTitle?: string | null
+  mrTitle?: string | null
+  /** The main MR's source branch, which names it better than `!3`. */
+  mrBranch?: string | null
+  /** Other merge requests the run touched, after the main one (`mrsOf`). */
+  moreMrs?: MrRef[]
+  summary?: string
+  progress?: Progress | null
+}
+
+/** How many of the newest finished runs a project keeps; the rest are in the cockpit. */
+export const FINISHED_SHOWN = 5
 
 export type ProjectSnapshot = {
   project: string
@@ -93,6 +131,10 @@ export type ProjectSnapshot = {
   live: LiveRun[]
   problems: Problem[]
   doneInWindow: number
+  /** The newest runs that ended (done or cancelled) within the window, newest first. */
+  finished?: FinishedRun[]
+  /** All of them, also those beyond `finished`. */
+  finishedInWindow?: number
 }
 
 export type CockpitSnapshot = {
@@ -176,6 +218,50 @@ export function progressOf(r: Run): Progress | null {
   return { steps: visuals, at: at + 1, name: steps[at].name ?? steps[at].id }
 }
 
+/** One merge request a run touched; `url` is null when only its number is known. */
+export type MrRef = { number: number | null; url: string | null; /** Its source branch, from the forge. */ branch?: string | null }
+
+const mrNumber = (url: string | null | undefined): number | null => {
+  const m = String(url ?? '').match(/\/(?:merge_requests|pull)\/(\d+)/)
+  return m ? Number(m[1]) : null
+}
+
+/** Every merge request the run touched, in the order it touched them: the one it worked on first
+ *  (usually the feature), then any it opened along the way - a security report, a changelog, a
+ *  follow-up. Cezar's own `pullRequestUrl` is the last one opened, so it can be such a side MR. A
+ *  URL comes from the ref itself, from `pullRequestUrl` of the same number, else from the one
+ *  candidate ending in that number (a continued MR is often recorded by number only). */
+export function mrsOf(r: Run): MrRef[] {
+  const candidate = (n: number | null): string | null => {
+    if (n == null) {
+      return null
+    }
+    const hits = (r.referencedPrCandidates ?? []).filter((u) => mrNumber(u) === n)
+    return hits.length === 1 ? hits[0] : null
+  }
+  const out: MrRef[] = []
+  const add = (number: number | null, url: string | null) => {
+    const n = number ?? mrNumber(url)
+    const same = out.find((m) => (n != null && m.number === n) || (url != null && m.url === url))
+    const known = url ?? (n != null && n === r.prNumber ? (r.pullRequestUrl ?? null) : null) ?? candidate(n)
+    if (same) {
+      same.url ??= known
+    } else if (n != null || known) {
+      out.push({ number: n, url: known })
+    }
+  }
+  for (const ref of r.prRefs ?? []) {
+    add(typeof ref.number === 'number' ? ref.number : null, ref.url ?? null)
+  }
+  if (r.pullRequestUrl || r.prNumber != null) {
+    add(r.prNumber ?? null, r.pullRequestUrl ?? null)
+  }
+  return out
+}
+
+/** The URL of the run's main merge request - the first it touched (see `mrsOf`). */
+export const mrUrlOf = (r: Run): string | null => mrsOf(r)[0]?.url ?? null
+
 /** The step a failed run stopped on. */
 export function failedStep(r: Run): string | undefined {
   const failed = (r.steps ?? []).filter((s) => s.status === 'failed').at(-1)?.id
@@ -222,17 +308,20 @@ export function summarize(runs: Run[], o: SummarizeOptions): ProjectSnapshot {
   const link = (id: string) => runLink(o.cockpit, o.project, id)
   const live: LiveRun[] = []
   const problems: Problem[] = []
+  const finishedRuns: FinishedRun[] = []
   let doneInWindow = 0
 
   for (const r of runs) {
+    const mrs = mrsOf(r)
     const base = {
       runId: r.id,
       title: runTitle(r),
       issueNumber: r.issueNumber ?? null,
-      prNumber: r.prNumber ?? null,
+      prNumber: mrs[0]?.number ?? null,
       url: link(r.id),
       issueUrl: r.referencedIssueUrl ?? null,
-      mrUrl: r.pullRequestUrl ?? null,
+      mrUrl: mrs[0]?.url ?? null,
+      moreMrs: mrs.slice(1),
       summary: (r.titleSummary || r.title || r.workflow || '').replace(/^#?\d+:\s*/, '').trim()
     }
     if (LIVE.has(r.status)) {
@@ -251,6 +340,7 @@ export function summarize(runs: Run[], o: SummarizeOptions): ProjectSnapshot {
         url: base.url,
         issueUrl: base.issueUrl,
         mrUrl: base.mrUrl,
+        moreMrs: base.moreMrs,
         summary: base.summary,
         progress: progressOf(r)
       })
@@ -293,6 +383,24 @@ export function summarize(runs: Run[], o: SummarizeOptions): ProjectSnapshot {
     if (r.status === 'done') {
       doneInWindow++
     }
+    if (r.status === 'done' || r.status === 'cancelled') {
+      const started = ms(r.startedAt)
+      finishedRuns.push({
+        id: r.id,
+        title: base.title,
+        status: r.status,
+        finishedAt: finished,
+        durationMs: started != null ? Math.max(0, finished - started) : null,
+        issueNumber: base.issueNumber,
+        prNumber: base.prNumber,
+        url: base.url,
+        issueUrl: base.issueUrl,
+        mrUrl: base.mrUrl,
+        moreMrs: base.moreMrs,
+        summary: base.summary,
+        progress: progressOf(r)
+      })
+    }
     if (r.status === 'failed') {
       const step = failedStep(r)
       problems.push({
@@ -316,7 +424,16 @@ export function summarize(runs: Run[], o: SummarizeOptions): ProjectSnapshot {
 
   live.sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))
   problems.sort((a, b) => (b.at ?? 0) - (a.at ?? 0))
-  return { project: o.project, ok: true, live, problems, doneInWindow }
+  finishedRuns.sort((a, b) => (b.finishedAt ?? 0) - (a.finishedAt ?? 0))
+  return {
+    project: o.project,
+    ok: true,
+    live,
+    problems,
+    doneInWindow,
+    finished: finishedRuns.slice(0, FINISHED_SHOWN),
+    finishedInWindow: finishedRuns.length
+  }
 }
 
 /** Failed runs in the snapshot whose reason has not been read from history yet. */
@@ -388,7 +505,7 @@ export const formatCockpits = (list: CockpitConfig[]): string =>
 const RUN_FIELDS = [
   'id', 'title', 'titleSummary', 'workflow', 'status', 'createdAt', 'startedAt', 'finishedAt', 'issueNumber',
   'prNumber', 'pullRequestUrl', 'referencedIssueUrl', 'currentStepId', 'error', 'autoResumeAt', 'archived',
-  'worktreeLifecycle'
+  'worktreeLifecycle', 'referencedPrCandidates'
 ] as const
 const STEP_FIELDS = ['id', 'name', 'kind', 'status', 'iterations', 'startedAt', 'finishedAt'] as const
 
@@ -404,6 +521,12 @@ export function slimRun(raw: unknown): Run | undefined {
     if (r[k] !== undefined) {
       out[k] = r[k]
     }
+  }
+  if (Array.isArray(r.prRefs)) {
+    out.prRefs = r.prRefs.map((x: Record<string, unknown>) => ({
+      ...(typeof x.number === 'number' ? { number: x.number } : {}),
+      ...(typeof x.url === 'string' ? { url: x.url } : {})
+    }))
   }
   if (Array.isArray(r.steps)) {
     out.steps = r.steps.map((st: Record<string, unknown>) =>
@@ -437,7 +560,7 @@ const hostOf = (url: string | null | undefined): string | undefined => {
   }
 }
 
-type Linked = { title: string; issueNumber: number | null; issueUrl?: string | null; mrUrl?: string | null }
+type Linked = { title: string; issueNumber: number | null; issueUrl?: string | null; mrUrl?: string | null; moreMrs?: MrRef[] }
 
 /** Drops links to another forge than the project's own (Cezar sometimes picks an issue URL out of
  *  free text, e.g. a gitlab.com issue), with the issue number it put in the title. */
@@ -457,5 +580,126 @@ export function keepOwnForge<T extends Linked>(item: T, repoUrl: string | undefi
   if (out.mrUrl && hostOf(out.mrUrl) !== own) {
     out.mrUrl = null
   }
+  if (out.moreMrs) {
+    out.moreMrs = out.moreMrs.map((m) => (m.url && hostOf(m.url) !== own ? { ...m, url: null } : m))
+  }
   return out
+}
+
+/** Runs that ended successfully since the last look, for the optional "run done" notification. */
+export function newlyDone(s: Snapshot, notified: ReadonlySet<string>): FinishedRun[] {
+  return allProjects(s)
+    .flatMap((p) => p.finished ?? [])
+    .filter((r) => r.status === 'done' && !notified.has(`${r.id}:done`))
+}
+
+/** A run's duration: "42 min", "1 h 12 min". */
+export function duration(ms: number | null | undefined): string {
+  if (ms == null) {
+    return ''
+  }
+  const min = Math.max(1, Math.round(ms / 60_000))
+  return min < 60 ? `${min} min` : `${Math.floor(min / 60)} h${min % 60 ? ` ${min % 60} min` : ''}`
+}
+
+// ---- "explain this run": an agent session in the project's own workspace ---------------------
+
+/** A repository's identity, the same for its HTTPS and SSH addresses:
+ *  `git@host:group/repo.git`, `ssh://git@host:2222/group/repo`, `https://host/group/repo` → `host/group/repo`. */
+export function repoKey(url: string | null | undefined): string | null {
+  const u = String(url ?? '').trim()
+  if (!u) {
+    return null
+  }
+  const scp = u.match(/^[^@/\s]+@([^:/\s]+):(?!\d+\/)(.+)$/)
+  let host: string
+  let path: string
+  if (scp) {
+    ;[, host, path] = scp
+  } else {
+    try {
+      const p = new URL(u)
+      host = p.hostname
+      path = p.pathname
+    } catch {
+      return null
+    }
+  }
+  path = path.replace(/^\/+|\/+$/g, '').replace(/\.git$/, '')
+  return host && path ? `${host}/${path}`.toLowerCase() : null
+}
+
+/** Where a run is to be explained: its cockpit, project and id, read back from the run's link. */
+export function parseRunLink(url: string): { cockpit: string; project: string; id: string } | null {
+  const m = url.match(/^(https?:\/\/.+?)\/p\/([^/]+)\/tasks\/([^/?#]+)/)
+  return m ? { cockpit: m[1], project: decodeURIComponent(m[2]), id: m[3] } : null
+}
+
+export type WorkspaceInfo = {
+  id: string
+  kind: 'worktree' | 'folder'
+  name: string
+  path: string
+  branch: string | null
+  hostId: string | null
+  /** `repoKey` of its `origin` remote; null when it is not a Git repository. */
+  repo: string | null
+}
+
+/** The workspace to explain a project's run in: one of that repository on this machine, the main
+ *  checkout (a folder, or the default branch) over a feature worktree. */
+export function pickWorkspace(list: readonly WorkspaceInfo[], repoUrl: string | null | undefined): WorkspaceInfo | null {
+  const key = repoKey(repoUrl)
+  if (!key) {
+    return null
+  }
+  const rank = (w: WorkspaceInfo) =>
+    (w.hostId == null ? 0 : 4) + (w.kind === 'folder' ? 0 : ['main', 'master'].includes(w.branch ?? '') ? 1 : 2)
+  return [...list].filter((w) => w.repo === key).sort((a, b) => rank(a) - rank(b))[0] ?? null
+}
+
+export const DEFAULT_EXPLAIN_PROMPT =
+  'Explain what is happening with Cezar run {url} (project {project}): which step it is on, ' +
+  'why it stopped or failed if it did, and what to do next.'
+
+/** The prompt for an "explain" session: `{url}`, `{title}`, `{project}`, `{cockpit}` and `{run}`
+ *  (the run's id) are filled in. The built-in prompt leaves `{title}` out: a run's title comes from
+ *  its issue, which anyone who can file issues writes, and the agent may run with its permission
+ *  prompts off - the link is enough, the agent reads the run itself. */
+export function explainPrompt(
+  template: string | null | undefined,
+  v: { url: string; title: string; project: string; cockpit: string; run: string }
+): string {
+  const t = template?.trim() || DEFAULT_EXPLAIN_PROMPT
+  return t.replace(/\{(url|title|project|cockpit|run)\}/g, (_, k: keyof typeof v) => v[k])
+}
+
+/** A skill's name and description, from the front matter of its SKILL.md. */
+export function skillMeta(text: string): { name: string; description: string } | null {
+  const fm = text.match(/^---\s*\n([\s\S]*?)\n---/)
+  const field = (k: string) => fm?.[1].match(new RegExp(`^${k}:\\s*(.+)$`, 'm'))?.[1].trim().replace(/^["']|["']$/g, '') ?? ''
+  const name = field('name')
+  return name ? { name, description: field('description') } : null
+}
+
+/** A skill that operates a Cezar cockpit: "cezar" in its name and "cockpit" (or "kokpit") in its
+ *  name or description. The first found wins: the person's own skills come first, then the workspace's. */
+export function cockpitSkill(skills: readonly { name: string; description: string }[]): string | null {
+  // A plugin's skill is named `plugin:skill`; "cezar" may be in either part.
+  return (
+    skills.find((s) => /cezar/i.test(s.name) && /cockpit|kokpit/i.test(`${s.name} ${s.description}`))?.name ?? null
+  )
+}
+
+/** The prompt to send: the person's own template, else the built-in one - run through the
+ *  cockpit skill when the workspace has one (a slash command, so it works for skills the agent
+ *  may not start by itself). */
+export function explainRequest(
+  template: string | null | undefined,
+  skill: string | null,
+  v: { url: string; title: string; project: string; cockpit: string; run: string }
+): string {
+  const own = template?.trim()
+  const text = explainPrompt(own, v)
+  return !own && skill ? `/${skill} ${text}` : text
 }

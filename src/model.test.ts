@@ -1,9 +1,21 @@
-import { parseRef, titleCall } from './forge'
+import { forgeInfo, parseRef, titleCall } from './forge'
 import { assert, test } from 'orca/testing'
 import {
   counts,
+  cockpitSkill,
+  explainPrompt,
+  explainRequest,
+  skillMeta,
+  parseRunLink,
+  pickWorkspace,
+  repoKey,
+  type WorkspaceInfo,
   keepOwnForge,
   progressOf,
+  mrUrlOf,
+  mrsOf,
+  duration,
+  newlyDone,
   refLabel,
   failureLine,
   failureReason,
@@ -208,8 +220,9 @@ test('forge refs: GitHub issues and pull requests, on github.com and an Enterpri
     'api',
     '--hostname',
     'github.com',
-    'repos/cli/cli/issues/1',
+    'repos/cli/cli/pulls/1',
   ])
+  assert.deepEqual(titleCall(parseRef('https://github.com/cli/cli/issues/2')!).at(-1), 'repos/cli/cli/issues/2')
   assert.deepEqual(titleCall(parseRef('https://git.example/a/m/-/merge_requests/3')!), [
     'api',
     '--hostname',
@@ -259,4 +272,141 @@ test('progress: one visual per step, at the running step, or where it failed', (
   })
   assert.deepEqual(f, { steps: ['done', 'failed', 'pending'], at: 2, name: 'b' })
   assert.equal(progressOf({ id: 'z', status: 'queued' }), null)
+})
+
+test('finished: done and cancelled runs of the window, newest first, with their duration', () => {
+  const t = (h: number) => new Date(NOW - h * 3_600_000).toISOString()
+  const s = summarize(
+    [
+      { id: 'd1', status: 'done', startedAt: t(3), finishedAt: t(2) },
+      { id: 'c1', status: 'cancelled', startedAt: t(1.5), finishedAt: t(1) },
+      { id: 'old', status: 'done', startedAt: t(50), finishedAt: t(49) },
+      { id: 'arch', status: 'done', finishedAt: t(1), archived: true },
+    ],
+    o,
+  )
+  assert.deepEqual(
+    s.finished?.map((r) => `${r.id}:${r.status}`),
+    ['c1:cancelled', 'd1:done'],
+  )
+  assert.equal(s.finishedInWindow, 2)
+  assert.equal(s.finished?.[1].durationMs, 3_600_000)
+  assert.equal(duration(42 * 60_000), '42 min')
+  assert.equal(duration(72 * 60_000), '1 h 12 min')
+  assert.equal(duration(120 * 60_000), '2 h')
+  const cockpit = { url: 'c', host: 'c', available: [], watched: [], credentialSource: null, streaming: true }
+  const snap: Snapshot = { at: NOW, cockpits: [{ ...cockpit, projects: [s] }] }
+  assert.deepEqual(
+    newlyDone(snap, new Set()).map((r) => r.id),
+    ['d1'],
+  )
+  assert.deepEqual(newlyDone(snap, new Set(['d1:done'])), [])
+})
+
+test('MR URL: opened, from a ref, or the one candidate with the run MR number', () => {
+  const u = (repo: string, n: number) => `https://git.example/g/${repo}/-/merge_requests/${n}`
+  assert.equal(mrUrlOf({ id: 'a', status: 'done', pullRequestUrl: u('x', 1) }), u('x', 1))
+  assert.equal(mrUrlOf({ id: 'b', status: 'done', prNumber: 2, prRefs: [{ number: 2, url: u('y', 2) }] }), u('y', 2))
+  assert.equal(
+    mrUrlOf({
+      id: 'c',
+      status: 'done',
+      prNumber: 19,
+      prRefs: [{ number: 19 }],
+      referencedPrCandidates: [u('a', 5), u('b', 19), u('c', 190)],
+    }),
+    u('b', 19),
+  )
+  assert.equal(mrUrlOf({ id: 'd', status: 'done', prNumber: 7, referencedPrCandidates: [u('a', 7), u('b', 7)] }), null)
+  assert.equal(mrUrlOf({ id: 'e', status: 'done', prNumber: 75, referencedPrCandidates: [u('a', 3)] }), null)
+})
+
+test('MRs: the feature the run worked on first, then the report it opened along the way', () => {
+  const u = (n: number) => `https://git.example/g/engine/-/merge_requests/${n}`
+  // Cezar's pullRequestUrl is the last MR opened - here a security report on the feature MR !3.
+  const run = {
+    id: 'sec',
+    status: 'failed',
+    pullRequestUrl: u(4),
+    prNumber: 4,
+    prRefs: [{ number: 3 }, { number: 4, url: u(4) }],
+    referencedPrCandidates: [u(1), 'https://git.example/g/other/-/merge_requests/453', u(3), u(4)],
+  }
+  assert.deepEqual(mrsOf(run), [
+    { number: 3, url: u(3) },
+    { number: 4, url: u(4) },
+  ])
+  assert.equal(mrUrlOf(run), u(3))
+  const s = summarize([{ ...run, finishedAt: new Date(NOW).toISOString(), error: 'x' }], o)
+  assert.equal(s.problems[0].mrUrl, u(3))
+  assert.equal(s.problems[0].prNumber, 3)
+  assert.deepEqual(s.problems[0].moreMrs, [{ number: 4, url: u(4) }])
+  assert.deepEqual(mrsOf({ id: 'none', status: 'done' }), [])
+})
+
+test('forge answers: an MR names its source branch (GitLab source_branch, GitHub head.ref)', () => {
+  assert.deepEqual(forgeInfo({ title: ' Draft: feat: D1 ', source_branch: 'feat/d1-phase-1' }), {
+    title: 'Draft: feat: D1',
+    branch: 'feat/d1-phase-1',
+  })
+  assert.deepEqual(forgeInfo({ title: 'Add x', head: { ref: 'add-x' } }), { title: 'Add x', branch: 'add-x' })
+  assert.deepEqual(forgeInfo({ title: 'An issue' }), { title: 'An issue', branch: null })
+  assert.deepEqual(forgeInfo(null), { title: null, branch: null })
+})
+
+test('repoKey: HTTPS and SSH addresses of one repository match', () => {
+  const k = 'git.example.com/group/sub/app'
+  assert.equal(repoKey('https://git.example.com/group/sub/app'), k)
+  assert.equal(repoKey('https://git.example.com/group/sub/app.git/'), k)
+  assert.equal(repoKey('git@git.example.com:group/sub/app.git'), k)
+  assert.equal(repoKey('ssh://git@git.example.com:2222/group/sub/app.git'), k)
+  assert.equal(repoKey(''), null)
+  assert.equal(repoKey('not a url'), null)
+})
+
+test('pickWorkspace: the main checkout of the run repository, on this machine', () => {
+  const ws = (id: string, x: Partial<WorkspaceInfo>): WorkspaceInfo => ({
+    id,
+    kind: 'worktree',
+    name: id,
+    path: `/w/${id}`,
+    branch: 'feat/x',
+    hostId: null,
+    repo: 'git.example.com/group/app',
+    ...x,
+  })
+  const list = [
+    ws('other', { repo: 'git.example.com/group/other', kind: 'folder' }),
+    ws('feature', {}),
+    ws('remote-main', { branch: 'main', hostId: 'ssh-box' }),
+    ws('main', { branch: 'main' }),
+  ]
+  assert.equal(pickWorkspace(list, 'git@git.example.com:group/app.git')?.id, 'main')
+  assert.equal(pickWorkspace(list.slice(0, 2), 'https://git.example.com/group/app')?.id, 'feature')
+  assert.equal(pickWorkspace(list, 'https://git.example.com/group/none'), null)
+  assert.equal(pickWorkspace(list, undefined), null)
+})
+
+test('explainPrompt fills the run in; an empty template takes the built-in one', () => {
+  const v = { url: 'https://c/p/app/tasks/r1', title: 'Fix login', project: 'app', cockpit: 'https://c', run: 'r1' }
+  assert.equal(explainPrompt('/cezar-skill explain {url} ({project}, {run})', v), '/cezar-skill explain https://c/p/app/tasks/r1 (app, r1)')
+  assert.match(explainPrompt('  ', v), /https:\/\/c\/p\/app\/tasks\/r1.*project app/)
+  assert.ok(!explainPrompt('', v).includes('Fix login'), 'the built-in prompt never carries the issue-written title')
+  assert.deepEqual(parseRunLink(v.url), { cockpit: 'https://c', project: 'app', id: 'r1' })
+})
+
+test('explain goes through a cockpit skill found in the workspace, unless the person wrote a prompt', () => {
+  const meta = skillMeta('---\nname: team-cezar-cockpit\ndisable-model-invocation: true\ndescription: Operate a Cezar agent cockpit from the terminal\n---\n# body')
+  assert.deepEqual(meta, { name: 'team-cezar-cockpit', description: 'Operate a Cezar agent cockpit from the terminal' })
+  assert.equal(skillMeta('# no front matter'), null)
+  const skills = [{ name: 'cezar-workflow', description: 'Write workflows' }, meta!]
+  assert.equal(cockpitSkill(skills), 'team-cezar-cockpit')
+  assert.equal(cockpitSkill([{ name: 'cezar-kokpit', description: '' }]), 'cezar-kokpit')
+  assert.equal(cockpitSkill([{ name: 'cezar-tools:cockpit', description: 'Operate a cockpit' }]), 'cezar-tools:cockpit')
+  assert.equal(cockpitSkill([{ name: 'cezar:tools', description: 'no match' }]), null)
+  assert.equal(cockpitSkill([{ name: 'other', description: 'a cockpit' }]), null)
+  const v = { url: 'https://c/p/app/tasks/r1', title: 'Fix', project: 'app', cockpit: 'https://c', run: 'r1' }
+  assert.match(explainRequest('', 'team-cezar-cockpit', v), /^\/team-cezar-cockpit Explain what is happening with Cezar run https:\/\/c\/p\/app\/tasks\/r1/)
+  assert.equal(explainRequest('look at {run}', 'team-cezar-cockpit', v), 'look at r1')
+  assert.ok(!explainRequest('', null, v).startsWith('/'))
 })

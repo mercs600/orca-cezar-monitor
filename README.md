@@ -14,7 +14,21 @@ never changes anything there.
   worktree that needs attention, a read error) and green while something runs; ✓ marks its problems
   as seen. Each task shows the cockpit's step dots (done, running, failed, pending) with its place in
   the workflow, e.g. `5/14 · <step>`; a click opens the run in the cockpit.
-- **Desktop notifications** on a new failed run, a question and a usage-limit hold.
+- **Finished runs:** each project ends with a collapsible "Zakończone" list - the last runs that
+  ended, with their duration.
+- **Merge requests by branch:** a task links every MR it touched, named by its source branch
+  (`feat/checkout-title`, not `!3`). The MR it worked on comes first; one it opened along the way
+  (a security report, a changelog) follows. A run that continued an MR often records its number
+  only: the URL is found among the issue's related MRs.
+- **Explain:** the "Wyjaśnij" button under a task starts an agent session (Claude by default) asked
+  to explain the run - in the workspace of the run's repository (its `origin` matches the project's
+  repository), else in the workspace you have open. When you have a Cezar cockpit skill installed (a
+  skill with "cezar" in its name and "cockpit" in its name or description, in `~/.claude/skills`,
+  `~/.agents/skills` or a Claude Code plugin), the prompt goes through it. It starts with
+  `orca agent launch --focus`, so the session opens as a chat or a terminal per your Orca settings
+  and is shown at once.
+- **Desktop notifications** on a new failed run, a question and a usage-limit hold; optionally when
+  a run finishes.
 
 ## Install
 
@@ -25,7 +39,8 @@ orca plugin install mercs600/orca-cezar-monitor@v0.4.0   # a release; leave out 
 ```
 
 Orca lists the access the plugin asks for - its own Node.js worker, its own storage, settings and
-encrypted secrets, desktop notifications - and runs nothing until you approve it and turn it on in
+encrypted secrets, desktop notifications, reading your workspaces and starting agents in them (for
+"Wyjaśnij") - and runs nothing until you approve it and turn it on in
 Settings → Plugins. It installs as `mercs600.cezar-monitor`; `orca plugin update` brings newer
 releases.
 
@@ -63,6 +78,12 @@ security add-generic-password -s 'cezar:cezar.example.com' -a '<login>' -w
 (github.com and Enterprise) - a task shows the title of its issue (or merge/pull request) with links
 to both. Without it the title is the run's summary from Cezar, with no links to that forge. The forge
 is told from the link itself: GitLab paths carry `/-/`.
+
+**Explain** (Settings → Cezar): "Explain with agent" picks the agent (`claude`, `codex`, ...);
+"Explain prompt" replaces the built-in prompt, with `{url}`, `{project}`, `{cockpit}`, `{run}` and
+`{title}` filled in. Start it with `/<skill>` to use a skill of your choice. The built-in prompt holds
+the run's link only: `{title}` comes from the issue, which anyone who files issues writes, so add it
+only if you trust them.
 
 ## Development
 

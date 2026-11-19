@@ -25,12 +25,14 @@ import {
   type Tone,
 } from 'orca'
 import {
+  duration,
   projectCounts,
   type Progress,
   type StepVisual,
   refLabel,
   type CockpitSnapshot,
   type LiveRun,
+  type MrRef,
   type Problem,
   type ProjectSnapshot,
 } from './model'
@@ -45,6 +47,22 @@ const login = atom('')
 const password = atom('')
 const newCockpit = atom('')
 const tab = atom('view', 'projects', { persist: 'plugin' })
+/** The run whose "explain" session is starting, by its link. */
+const explaining = atom<string | null>(null)
+/** What the last "explain" did: where the session opened, or why it did not. */
+const notice = atom<{ tone: Tone; text: string } | null>(null)
+
+async function explain(url: string, title: string): Promise<void> {
+  set(explaining, url)
+  try {
+    const { workspace } = await plugin.request('cezar.explain', { url, title })
+    set(notice, { tone: 'success', text: `Otwieram sesję w ${workspace}: ${title}` })
+  } catch (e) {
+    set(notice, { tone: 'danger', text: (e as Error).message })
+  } finally {
+    set(explaining, null)
+  }
+}
 
 async function call(p: Promise<MonitorState>): Promise<void> {
   try {
@@ -95,6 +113,7 @@ const PROBLEM_LABEL: Record<Problem['kind'], string> = {
  *  row opens the run; Orca allows nothing pressable inside a ListItem, so the links sit under it. */
 function Entry({
   tone,
+  mark = '●',
   title,
   url,
   meta,
@@ -102,6 +121,9 @@ function Entry({
   issueUrl,
   mrUrl,
   issueNumber,
+  prNumber,
+  moreMrs = [],
+  mrBranch,
   project,
   issueTitle,
   mrTitle,
@@ -110,6 +132,8 @@ function Entry({
 }: {
   progress?: Progress | null
   tone: Tone
+  /** The status mark: a dot, or ✓ for a finished run. */
+  mark?: string
   title: string
   url: string
   meta: string
@@ -118,6 +142,12 @@ function Entry({
   issueUrl?: string | null
   mrUrl?: string | null
   issueNumber?: number | null
+  /** The run's MR number, shown without a link when its URL is unknown. */
+  prNumber?: number | null
+  /** Other MRs the run touched after the main one: a security report, a changelog... */
+  moreMrs?: MrRef[]
+  /** The main MR's source branch: shown instead of `!3`, which says little. */
+  mrBranch?: string | null
   issueTitle?: string | null
   mrTitle?: string | null
   summary?: string
@@ -127,7 +157,7 @@ function Entry({
   // The issue's (or MR's) own title says what the run is about; Cezar's summary says what it does.
   const heading = issueTitle ?? mrTitle ?? title
   const detail = (heading !== title && summary ? [summary, meta] : [meta]).filter(Boolean).join(' · ')
-  const hasLinks = Boolean((issue && issueUrl) || (mr && mrUrl))
+  const hasLinks = Boolean((issue && issueUrl) || (mr && mrUrl) || prNumber != null || moreMrs.length)
   return (
     <Stack gap="none">
       <List label={heading}>
@@ -135,7 +165,7 @@ function Entry({
           <Box direction="row" gap="sm" align="start">
             <Box shrink={false}>
               <Text tone={tone} size="sm">
-                ●
+                {mark}
               </Text>
             </Box>
             <Box grow minWidth={0}>
@@ -161,24 +191,50 @@ function Entry({
           </Box>
         </ListItem>
       </List>
-      {hasLinks ? (
-        // The footer starts under the title, as the branch line of an Orca activity entry does.
-        <Box direction="row">
-          <Box width={LINK_INDENT} shrink={false} />
-          <Row gap="sm" wrap>
-            {issue && issueUrl ? (
-              <Text size="xs" muted>
-                <Link onPress={() => open(issueUrl)}>{`📋 ${issue}`}</Link>
-              </Text>
-            ) : null}
-            {mr && mrUrl ? (
-              <Text size="xs" muted>
-                <Link onPress={() => open(mrUrl)}>{`🔀 ${mr}`}</Link>
-              </Text>
-            ) : null}
-          </Row>
+      {/* The footer starts under the title, as the branch line of an Orca activity entry does. */}
+      <Box direction="row" align="center">
+        <Box width={LINK_INDENT} shrink={false} />
+        <Box grow minWidth={0}>
+          {hasLinks ? (
+            <Row gap="sm" wrap>
+              {issue && issueUrl ? (
+                <Text size="xs" muted>
+                  <Link onPress={() => open(issueUrl)}>{`📋 ${issue}`}</Link>
+                </Text>
+              ) : null}
+              {mr && mrUrl ? (
+                <Text size="xs" muted>
+                  <Link onPress={() => open(mrUrl)}>{`🔀 ${mrBranch ?? mr}`}</Link>
+                </Text>
+              ) : prNumber != null ? (
+                // The run recorded the MR's number only and its repository is unknown: no link.
+                <Text size="xs" muted>{`🔀 !${prNumber}`}</Text>
+              ) : null}
+              {moreMrs.map((m) =>
+                m.url ? (
+                  <Text size="xs" muted>
+                    <Link onPress={() => open(m.url!)}>{`🔀 ${m.branch ?? refLabel(m.url, null, project)}`}</Link>
+                  </Text>
+                ) : m.number != null ? (
+                  <Text size="xs" muted>{`🔀 !${m.number}`}</Text>
+                ) : null
+              )}
+            </Row>
+          ) : null}
         </Box>
-      ) : null}
+        <Box shrink={false}>
+          <Button
+            size="xs"
+            variant="ghost"
+            icon="agent"
+            tooltip="Nowa sesja agenta w workspace projektu wyjaśni, co się dzieje z tym runem"
+            disabled={read(explaining) === url}
+            onPress={() => explain(url, heading)}
+          >
+            Wyjaśnij
+          </Button>
+        </Box>
+      </Box>
     </Stack>
   )
 }
@@ -227,6 +283,64 @@ function runMeta(run: LiveRun): string {
               : `${run.step}${run.attempt > 1 ? ` (próba ${run.attempt})` : ''}`,
           ]
   return parts.filter(Boolean).join(' · ')
+}
+
+/** The runs that ended in the window - done (✓) or cancelled - as a collapsed sub-group, newest
+ *  first, at most FINISHED_SHOWN of them; the rest are a link away, in the cockpit. */
+function Finished({ cockpit, p }: { cockpit: CockpitSnapshot; p: ProjectSnapshot }) {
+  const finished = p.finished ?? []
+  if (!finished.length) {
+    return null
+  }
+  const key = `${cockpit.host}/${p.project}#finished`
+  const isOpen = read(opened)[key] ?? false
+  const total = p.finishedInWindow ?? finished.length
+  return (
+    <Stack gap="sm">
+      <List label={`Zakończone - ${p.project}`}>
+        <ListItem
+          icon={isOpen ? 'collapse' : 'expand'}
+          onPress={() => update(opened, (o) => ({ ...o, [key]: !isOpen }))}
+        >
+          <Text size="xs" muted weight="semibold">
+            {`Zakończone · ${total}`}
+          </Text>
+        </ListItem>
+      </List>
+      {isOpen
+        ? finished.map((r) => (
+            <Entry
+              project={p.project}
+              mark={r.status === 'done' ? '✓' : '–'}
+              tone={r.status === 'done' ? 'success' : 'neutral'}
+              title={r.title}
+              url={r.url}
+              time={clock(r.finishedAt)}
+              meta={[r.status === 'cancelled' ? 'anulowany' : '', duration(r.durationMs)].filter(Boolean).join(' · ')}
+              issueUrl={r.issueUrl}
+              mrUrl={r.mrUrl}
+              issueNumber={r.issueNumber}
+              prNumber={r.prNumber}
+              moreMrs={r.moreMrs}
+              mrBranch={r.mrBranch}
+              issueTitle={r.issueTitle}
+              mrTitle={r.mrTitle}
+              summary={r.summary}
+              progress={r.progress}
+            />
+          ))
+        : null}
+      {isOpen && total > finished.length ? (
+        <Box paddingX="lg">
+          <Text size="xs" muted>
+            <Link onPress={() => open(`${cockpit.url}/p/${encodeURIComponent(p.project)}`)}>
+              {`wszystkie (${total}) w kokpicie`}
+            </Link>
+          </Text>
+        </Box>
+      ) : null}
+    </Stack>
+  )
 }
 
 /** A project as a group of Orca's activity list: chevron, name in small capitals, a status dot,
@@ -303,6 +417,9 @@ function ProjectNode({
               issueUrl={x.issueUrl}
               mrUrl={x.mrUrl}
               issueNumber={x.issueNumber}
+              prNumber={x.prNumber}
+              moreMrs={x.moreMrs}
+              mrBranch={x.mrBranch}
               issueTitle={x.issueTitle}
               mrTitle={x.mrTitle}
               summary={x.summary}
@@ -320,6 +437,9 @@ function ProjectNode({
               issueUrl={run.issueUrl}
               mrUrl={run.mrUrl}
               issueNumber={run.issueNumber}
+              prNumber={run.prNumber}
+              moreMrs={run.moreMrs}
+              mrBranch={run.mrBranch}
               issueTitle={run.issueTitle}
               mrTitle={run.mrTitle}
               summary={run.summary}
@@ -329,10 +449,11 @@ function ProjectNode({
           {p.ok && !problems.length && !p.live.length ? (
             <Box paddingX="lg" paddingY="xs">
               <Text size="xs" muted>
-                {p.doneInWindow ? `Nic nie leci · ${p.doneInWindow} ukończonych w oknie` : 'Nic nie leci'}
+                Nic nie leci
               </Text>
             </Box>
           ) : null}
+          <Finished cockpit={cockpit} p={p} />
         </Stack>
       ) : null}
     </Stack>
@@ -490,6 +611,14 @@ export default function Panel() {
         <Text size="xs" tone="danger">
           {err}
         </Text>
+      ) : null}
+      {read(notice) ? (
+        <Row justify="between" align="start">
+          <Text size="xs" tone={read(notice)!.tone}>
+            {read(notice)!.text}
+          </Text>
+          <IconButton icon="close" label="Zamknij" size="xs" variant="ghost" onPress={() => set(notice, null)} />
+        </Row>
       ) : null}
       {/* Like Orca's own sidebar modules: a header with icon actions, no tabs. */}
       <Row justify="between">

@@ -27,6 +27,9 @@ declare module 'orca' {
     'cezar.removeCockpit': { input: { url: string }; output: MonitorState }
     /** A login for one cockpit, kept in the plugin's encrypted secrets. */
     'cezar.setLogin': { input: { cockpit: string; login: string; password: string }; output: MonitorState }
+    /** Starts an agent session (Claude by default) in the run's project workspace, asked to explain
+     *  the run; answers the workspace's name. */
+    'cezar.explain': { input: { url: string; title: string }; output: { workspace: string } }
   }
   interface PluginPanelEvents {
     /** Posted to every open panel after each change. */

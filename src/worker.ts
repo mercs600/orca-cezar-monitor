@@ -7,15 +7,29 @@
 //     carry each run as it changes - so the panel is live without polling.
 // It keeps the last snapshot in storage, updates the status bar, tells open panels and shows a
 // desktop notification for each new failure, question or hold. It only reads the cockpits.
+import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { readdir, readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import type { OrcaWorkerApi } from 'orca/worker'
 import { findCredentials, type Credentials } from './credentials'
-import { cliAvailable, fetchTitle, parseRef, type Forge } from './forge'
+import { cliAvailable, fetchRelatedMrs, fetchTitle, parseRef, type Forge } from './forge'
 import {
   counts,
+  cockpitSkill,
+  explainRequest,
+  skillMeta,
   failureReason,
+  parseRunLink,
+  pickWorkspace,
+  repoKey,
   formatCockpits,
   keepOwnForge,
+  duration,
   newProblems,
+  newlyDone,
+  refLabel,
   parseCockpits,
   reasonsToRead,
   slimRun,
@@ -23,10 +37,12 @@ import {
   type CockpitConfig,
   type CockpitSnapshot,
   type HistoryEvent,
+  type MrRef,
   type Problem,
   type ProjectSnapshot,
   type Run,
-  type Snapshot
+  type Snapshot,
+  type WorkspaceInfo
 } from './model'
 import type { MonitorState } from './protocol'
 
@@ -39,7 +55,98 @@ type Settings = {
   fullRefreshMinutes: number
   windowHours: number
   notify: boolean
+  notifyDone: boolean
+  explainAgent: string
+  explainPrompt: string
 }
+
+/** A folder's `origin` remote, or null when it is not a Git repository (or has none). */
+type SkillMeta = { name: string; description: string }
+
+/** The skills in each `<root>/<skill>/SKILL.md`; `prefix` names a Claude Code plugin's skills
+ *  (`/plugin:skill`). */
+async function skillsUnder(roots: string[], prefix = ''): Promise<SkillMeta[]> {
+  const out: SkillMeta[] = []
+  for (const root of roots) {
+    for (const n of await readdir(root).catch(() => [] as string[])) {
+      const meta = skillMeta(await readFile(join(root, n, 'SKILL.md'), 'utf8').catch(() => ''))
+      if (meta) {
+        out.push({ ...meta, name: prefix + meta.name })
+      }
+    }
+  }
+  return out
+}
+
+/** The person's own skills: `~/.claude/skills`, `~/.agents/skills` and those of the Claude Code
+ *  plugins they installed (`~/.claude/plugins/installed_plugins.json`). */
+async function globalSkills(): Promise<SkillMeta[]> {
+  const home = homedir()
+  const own = await skillsUnder([join(home, '.claude', 'skills'), join(home, '.agents', 'skills')])
+  let installed: Record<string, { installPath?: string }[]> = {}
+  try {
+    installed = JSON.parse(await readFile(join(home, '.claude', 'plugins', 'installed_plugins.json'), 'utf8')).plugins ?? {}
+  } catch {
+    // no Claude Code plugins
+  }
+  const fromPlugins = await Promise.all(
+    Object.entries(installed).map(([id, installs]) => {
+      const path = installs.at(-1)?.installPath
+      return path ? skillsUnder([join(path, 'skills')], `${id.split('@')[0]}:`) : []
+    })
+  )
+  return [...own, ...fromPlugins.flat()]
+}
+
+/** A project's own skills, in `<dir>/.claude/skills` and `<dir>/.agents/skills`. */
+const skillsIn = (dir: string) => skillsUnder([join(dir, '.claude', 'skills'), join(dir, '.agents', 'skills')])
+
+/** Orca's own CLI: the one in the app bundle, else one on the PATH (`CEZAR_ORCA_CLI` overrides,
+ *  for the tests). */
+const ORCA_CLI_PATHS = [
+  '/Applications/Orca.app/Contents/Resources/bin/orca',
+  join(homedir(), 'Applications/Orca.app/Contents/Resources/bin/orca'),
+  '/opt/homebrew/bin/orca',
+  '/usr/local/bin/orca'
+]
+const orcaCli = (): string => process.env.CEZAR_ORCA_CLI || (ORCA_CLI_PATHS.find((p) => existsSync(p)) ?? 'orca')
+
+/** Starts an agent with Orca's CLI (`orca agent launch --focus`): as a chat or a terminal per the
+ *  person's setting, shown at once, the prompt delivered when the agent is ready. The plugin API's
+ *  `agent.launch` opens a background terminal only and can drop the prompt while the agent starts.
+ *  Rejects with `code: 'ENOENT'` when there is no CLI; any other failure (a refusal, a timeout)
+ *  may come after the session started, so it is not retried another way. */
+const launchWithCli = (agent: string, path: string, prompt: string): Promise<void> =>
+  new Promise((resolve, reject) => {
+    execFile(
+      orcaCli(),
+      ['agent', 'launch', '--agent', agent, '--worktree', `path:${path}`, '--prompt', prompt, '--focus', '--json'],
+      { timeout: 60_000, encoding: 'utf8' },
+      (err, out) => {
+        let ok = false
+        try {
+          ok = (JSON.parse(out) as { ok?: boolean }).ok === true
+        } catch {
+          // not JSON: an old CLI, or none
+        }
+        if (ok) {
+          resolve()
+        } else if ((err as NodeJS.ErrnoException | null)?.code === 'ENOENT') {
+          reject(err)
+        } else {
+          const msg = String(out).trim().slice(0, 300) || err?.message || 'no answer'
+          reject(new Error(`Orca nie uruchomiła agenta: ${msg}`))
+        }
+      }
+    )
+  })
+
+const originOf = (dir: string): Promise<string | null> =>
+  new Promise((resolve) => {
+    execFile('git', ['-C', dir, 'remote', 'get-url', 'origin'], { timeout: 5_000 }, (err, out) =>
+      resolve(err ? null : String(out).trim() || null)
+    )
+  })
 
 class HttpError extends Error {
   constructor(
@@ -88,8 +195,11 @@ export default function activate(orca: OrcaWorkerApi): void {
   let fullTimer: ReturnType<typeof setInterval> | undefined
   let tickTimer: ReturnType<typeof setInterval> | undefined
   let reasons: Record<string, string> = {}
-  /** GitLab titles by issue or MR URL; `title: null` = could not be read (retried after a while). */
-  let titles: Record<string, { title: string | null; at: number }> = {}
+  /** Titles (and MR source branches) by issue or MR URL; `title: null` = could not be read (retried
+   *  after a while). An entry without `branch` predates branches and is read again. */
+  let titles: Record<string, { title: string | null; branch?: string | null; at: number }> = {}
+  /** GitLab's related MRs by issue URL, to give a URL to a run's MR number; null = not readable. */
+  let related: Record<string, { mrs: { iid: number; url: string }[] | null; at: number }> = {}
   /** Which forge CLIs are installed: links to that forge are shown, with their titles. */
   const clis: Record<Forge, boolean> = { gitlab: false, github: false }
   /** A link is shown when its forge's CLI is installed; one no CLI reads (an unknown forge) too. */
@@ -111,7 +221,10 @@ export default function activate(orca: OrcaWorkerApi): void {
       cockpits: parseCockpits(s.cockpits),
       fullRefreshMinutes: Math.max(5, num(s.fullRefreshMinutes, 30)),
       windowHours: num(s.windowHours, 24),
-      notify: s.notify !== false
+      notify: s.notify !== false,
+      notifyDone: s.notifyDone === true,
+      explainAgent: typeof s.explainAgent === 'string' && s.explainAgent.trim() ? s.explainAgent.trim() : 'claude',
+      explainPrompt: typeof s.explainPrompt === 'string' ? s.explainPrompt : ''
     }
   }
 
@@ -371,22 +484,40 @@ export default function activate(orca: OrcaWorkerApi): void {
         const runs = [...(w.runs.get(project)?.values() ?? [])]
         const s = summarize(runs, { cockpit: w.cfg.url, project, now, windowHours: cfg.windowHours, reasons })
         const repo = w.repos.get(project)
-        const titled = <T extends { issueUrl?: string | null; mrUrl?: string | null }>(x: T): T => {
-          // Without the forge's CLI: Cezar's own title, and no link to that forge.
+        const titled = <
+          T extends { issueUrl?: string | null; mrUrl?: string | null; prNumber?: number | null; moreMrs?: MrRef[] }
+        >(
+          x: T
+        ): T => {
+          // A run that continued an MR recorded its number only: find it among the issue's MRs.
+          const resolve = (url: string | null | undefined, n: number | null | undefined): string | null => {
+            if (!url && n != null && x.issueUrl) {
+              const hits = (related[x.issueUrl]?.mrs ?? []).filter((m) => m.iid === n)
+              url = hits.length === 1 ? hits[0].url : null
+            }
+            // Without the forge's CLI: Cezar's own title, and no link to that forge.
+            return url && linkable(url) ? url : null
+          }
           const issueUrl = linkable(x.issueUrl) ? x.issueUrl : null
-          const mrUrl = linkable(x.mrUrl) ? x.mrUrl : null
+          const mrUrl = resolve(x.mrUrl, x.prNumber)
           return {
             ...x,
             issueUrl,
             mrUrl,
+            moreMrs: (x.moreMrs ?? []).map((m) => {
+              const url = resolve(m.url, m.number)
+              return { number: m.number, url, branch: url ? (titles[url]?.branch ?? null) : null }
+            }),
             issueTitle: issueUrl ? (titles[issueUrl]?.title ?? null) : null,
-            mrTitle: mrUrl ? (titles[mrUrl]?.title ?? null) : null
+            mrTitle: mrUrl ? (titles[mrUrl]?.title ?? null) : null,
+            mrBranch: mrUrl ? (titles[mrUrl]?.branch ?? null) : null
           }
         }
         return {
           ...s,
           live: s.live.map((x) => titled(keepOwnForge(x, repo))),
-          problems: s.problems.map((x) => titled(keepOwnForge(x, repo)))
+          problems: s.problems.map((x) => titled(keepOwnForge(x, repo))),
+          finished: (s.finished ?? []).map((x) => titled(keepOwnForge(x, repo)))
         }
       })
       return {
@@ -425,19 +556,57 @@ export default function activate(orca: OrcaWorkerApi): void {
     return read
   }
 
+  /** Reads, for runs with an MR number and no MR URL, the MRs GitLab relates to their issue. */
+  async function readRelated(snap: Snapshot): Promise<boolean> {
+    if (!clis.gitlab) {
+      return false
+    }
+    const now = Date.now()
+    const wanted = new Set(
+      snap.cockpits.flatMap((c) =>
+        c.projects.flatMap((p) =>
+          [...p.live, ...p.problems, ...(p.finished ?? [])]
+            .filter((x) => x.issueUrl && ((x.prNumber != null && !x.mrUrl) || (x.moreMrs ?? []).some((m) => !m.url)))
+            .map((x) => x.issueUrl as string)
+        )
+      )
+    )
+    // Re-read after 10 minutes: a continued MR may be linked to its issue later.
+    const missing = [...wanted].filter((u) => !related[u] || now - related[u].at > 600_000)
+    for (const url of missing.slice(0, 10)) {
+      const ref = parseRef(url)
+      related[url] = { mrs: ref ? await fetchRelatedMrs(ref) : null, at: Date.now() }
+    }
+    if (missing.length) {
+      related = Object.fromEntries(Object.entries(related).filter(([u, r]) => wanted.has(u) || now - r.at < 86_400_000))
+      await orca.storage.set('related', related)
+    }
+    return missing.length > 0
+  }
+
   /** Reads the titles of the issues and MRs the snapshot links to and does not know yet. */
   async function readTitles(snap: Snapshot): Promise<boolean> {
     const now = Date.now()
     const urls = new Set(
       snap.cockpits.flatMap((c) =>
-        c.projects.flatMap((p) => [...p.live, ...p.problems].flatMap((x) => [x.issueUrl, x.mrUrl]))
+        c.projects.flatMap((p) =>
+          [...p.live, ...p.problems, ...(p.finished ?? [])].flatMap((x) => [
+            x.issueUrl,
+            x.mrUrl,
+            ...(x.moreMrs ?? []).map((m) => m.url)
+          ])
+        )
       )
     )
-    const stale = (u: string) => !titles[u] || (titles[u].title === null && now - titles[u].at > 3_600_000)
+    const stale = (u: string) =>
+      !titles[u] ||
+      (titles[u].title === null && now - titles[u].at > 3_600_000) ||
+      (parseRef(u)?.kind === 'change' && titles[u].title !== null && titles[u].branch === undefined)
     // Only links shown (their forge's CLI is installed) that a CLI can read.
     const missing = [...urls].filter((u): u is string => Boolean(u) && Boolean(parseRef(u)) && stale(u as string))
     for (const url of missing.slice(0, 10)) {
-      titles[url] = { title: await fetchTitle(parseRef(url)!), at: Date.now() }
+      const info = await fetchTitle(parseRef(url)!)
+      titles[url] = { title: info?.title ?? null, branch: info?.branch ?? null, at: Date.now() }
     }
     if (missing.length) {
       // Keep what is linked now, plus a day of the rest, so the cache does not grow for ever.
@@ -459,6 +628,9 @@ export default function activate(orca: OrcaWorkerApi): void {
         again = false
         const cfg = await readSettings()
         let snap = await build(cfg)
+        if (await readRelated(snap)) {
+          snap = await build(cfg)
+        }
         const newTitles = await readTitles(snap)
         if (newTitles) {
           snap = await build(cfg)
@@ -533,18 +705,45 @@ export default function activate(orca: OrcaWorkerApi): void {
   }
 
   async function notify(cfg: Settings, snap: Snapshot): Promise<void> {
-    const keys = snap.cockpits.flatMap((c) => c.projects.flatMap((p) => p.problems.map((x) => x.key)))
+    // Problems by their key, finished runs as `<id>:done` - both remembered whether or not their
+    // notification is on, so turning one on later does not report the past.
+    const keys = snap.cockpits.flatMap((c) =>
+      c.projects.flatMap((p) => [
+        ...p.problems.map((x) => x.key),
+        ...(p.finished ?? []).filter((r) => r.status === 'done').map((r) => `${r.id}:done`)
+      ])
+    )
     const before = await orca.storage.get('notified')
     if (before === null) {
-      // First look ever: what is already broken is not news.
+      // First look ever: what is already broken or done is not news.
       await orca.storage.set('notified', keys)
       return
     }
-    const fresh = newProblems(snap, new Set(strings(before))).filter((p) => NOTIFY_KINDS.has(p.kind))
+    const seen = new Set(strings(before))
+    const fresh = newProblems(snap, seen).filter((p) => NOTIFY_KINDS.has(p.kind))
+    const done = newlyDone(snap, seen)
     // Remember only what still exists, so the list never grows without bound; a project that
     // could not be read keeps its old keys, so a reconnect does not notify everything again.
     const unreadable = snap.cockpits.some((c) => c.error || c.projects.some((p) => !p.ok))
     await orca.storage.set('notified', [...new Set(unreadable ? [...strings(before), ...keys] : keys)])
+    const show = (title: string, body: string) =>
+      orca.host.call('notifications.show', { title, body }).catch((e: Error) => orca.log(`notification: ${e.message}`))
+
+    if (cfg.notifyDone && done.length) {
+      const name = (r: (typeof done)[number]) => r.issueTitle ?? r.mrTitle ?? r.title
+      if (done.length > 3) {
+        await show(`Cezar: ${done.length} runy zakończone`, done.map(name).join('\n'))
+      } else {
+        for (const r of done) {
+          const mr = r.mrUrl ? refLabel(r.mrUrl) : undefined
+          await show(
+            `Cezar: zakończony - ${name(r).slice(0, 80)}`,
+            [duration(r.durationMs), mr ? `MR ${mr}` : ''].filter(Boolean).join(' · ') || 'run zakończony'
+          )
+        }
+      }
+    }
+
     if (!cfg.notify || !fresh.length) {
       return
     }
@@ -555,8 +754,6 @@ export default function activate(orca: OrcaWorkerApi): void {
       retrying: 'ponawia bramkę',
       attention: 'wymaga uwagi'
     }
-    const show = (title: string, body: string) =>
-      orca.host.call('notifications.show', { title, body }).catch((e: Error) => orca.log(`notification: ${e.message}`))
     if (fresh.length > 3) {
       await show(`Cezar: ${fresh.length} nowe problemy`, fresh.map((p) => `${p.title} - ${label[p.kind]}`).join('\n'))
       return
@@ -612,6 +809,70 @@ export default function activate(orca: OrcaWorkerApi): void {
     }
     return state()
   })
+  /** `origin` of each workspace folder, read once: a workspace's repository does not change. */
+  const origins = new Map<string, string | null>()
+  async function workspaces(): Promise<WorkspaceInfo[]> {
+    const { workspaces: list } = await orca.host.call('workspace.list')
+    return Promise.all(
+      list.map(async (w) => {
+        if (!origins.has(w.path)) {
+          // Only this machine's folders can be read; a workspace on another host has no repo here.
+          origins.set(w.path, w.hostId == null ? repoKey(await originOf(w.path)) : null)
+        }
+        return { ...w, repo: origins.get(w.path) ?? null }
+      })
+    )
+  }
+  /** The focused workspace: `workspace.readContext` names it (no id), the list has its id. */
+  async function focusedWorkspace(): Promise<WorkspaceInfo | null> {
+    const ctx = await orca.host.call('workspace.readContext')
+    if (!ctx) {
+      return null
+    }
+    const list = await workspaces()
+    const named = list.filter((w) => w.name === ctx.displayName)
+    return named.find((w) => (w.branch ?? '') === ctx.branch) ?? named[0] ?? list.find((w) => w.branch === ctx.branch) ?? null
+  }
+  orca.panels.handle('cezar.explain', async ({ url, title }) => {
+    const run = parseRunLink(url)
+    const w = run && watches.find((x) => x.cfg.url === run.cockpit)
+    if (!run || !w) {
+      throw Object.assign(new Error(`nieznany run: ${url}`), { code: 'invalid_params' })
+    }
+    const repoUrl = w.repos.get(run.project)
+    let ws = pickWorkspace(await workspaces(), repoUrl)
+    if (!ws && repoUrl) {
+      // A workspace added since the last look, or a remote changed: read the folders again.
+      origins.clear()
+      ws = pickWorkspace(await workspaces(), repoUrl)
+    }
+    if (!ws) {
+      // No checkout of the project here: the workspace in front of the person, as it is.
+      ws = await focusedWorkspace()
+    }
+    if (!ws) {
+      throw new Error(
+        repoUrl
+          ? `Brak workspace'u z repozytorium ${repoUrl} w Orce i żaden nie jest otwarty.`
+          : `Kokpit nie podaje repozytorium projektu ${run.project}, a żaden workspace nie jest otwarty.`
+      )
+    }
+    const cfg = await readSettings()
+    // The cockpit skill: the person's own (installed for every project), else the workspace's.
+    const skill = cfg.explainPrompt.trim() ? null : cockpitSkill([...(await globalSkills()), ...(await skillsIn(ws.path))])
+    const prompt = explainRequest(cfg.explainPrompt, skill, { url, title, project: run.project, cockpit: run.cockpit, run: run.id })
+    try {
+      await launchWithCli(cfg.explainAgent, ws.path, prompt)
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw e
+      }
+      // No Orca CLI: the plugin API, which opens the session in the background.
+      orca.log('orca CLI not found; starting the agent with agent.launch')
+      await orca.host.call('agent.launch', { workspaceId: ws.id, agent: cfg.explainAgent, prompt })
+    }
+    return { workspace: ws.name }
+  })
   orca.commands.register('cezar.refresh', async () => {
     await refreshAll()
     return 'Cezar odświeżony'
@@ -633,6 +894,7 @@ export default function activate(orca: OrcaWorkerApi): void {
   void (async () => {
     reasons = ((await orca.storage.get('reasons')) as Record<string, string> | null) ?? {}
     titles = ((await orca.storage.get('titles')) as typeof titles | null) ?? {}
+    related = ((await orca.storage.get('related')) as typeof related | null) ?? {}
     // Never hold the start on it: the panel shows Cezar's titles until glab answers.
     for (const f of ['gitlab', 'github'] as const) {
       void cliAvailable(f).then((ok) => {

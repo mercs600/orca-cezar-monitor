@@ -6,6 +6,17 @@ import type { MonitorState } from './protocol'
 import * as main from './worker'
 
 const realFetch = globalThis.fetch
+// Never Orca's real CLI here: it would open agent sessions. A fake one records its arguments.
+const fakeCli = `${process.env.TMPDIR ?? '/tmp'}/cezar-fake-orca-${process.pid}`
+const cliLog = `${fakeCli}.log`
+await import('node:fs').then((fs) => {
+  fs.writeFileSync(
+    fakeCli,
+    `#!/bin/sh\nif [ -n "$FAKE_ORCA_FAIL" ]; then echo nope; exit 1; fi\nprintf '%s\\n' "$@" > '${cliLog}'\necho '{"ok":true}'\n`,
+    { mode: 0o755 }
+  )
+})
+process.env.CEZAR_ORCA_CLI = fakeCli
 const mounted: { deactivate(): Promise<void> }[] = []
 afterEach(async () => {
   // A failed assertion skips the test's own deactivate: stop its streams and timers here.
@@ -18,7 +29,7 @@ const mount = async (host: ReturnType<typeof mockHost>) => {
   return w
 }
 
-type Cockpit = { projects: string[]; runs: Record<string, Run[]>; status?: number }
+type Cockpit = { projects: string[]; runs: Record<string, Run[]>; status?: number; repos?: Record<string, string> }
 type Fake = {
   calls: string[]
   /** Sends a `run` event on every open stream of that host and project. */
@@ -44,7 +55,7 @@ function fakeCockpits(cockpits: Record<string, Cockpit>): Fake {
     }
     const path = url.pathname.replace(/^\/api\/v1/, '')
     if (path === '/projects') {
-      return Response.json({ projects: c.projects.map((id) => ({ id })) })
+      return Response.json({ projects: c.projects.map((id) => ({ id, repoUrl: c.repos?.[id] })) })
     }
     const m = path.match(/^\/p\/([^/]+)\/(runs|events)$/)
     if (m?.[2] === 'runs') {
@@ -232,5 +243,117 @@ test('a project picked in the panel is written to the cockpits setting', async (
   await until(worker, (x) => Boolean(x.snapshot?.cockpits[0]?.available.length))
   await worker.request('cezar.setProjects', { cockpit: 'https://a.example:4443', projects: ['api'] })
   assert.equal(host.data().settings.cockpits, 'https://a.example:4443 api')
+  await worker.deactivate()
+})
+
+test('a run that finishes is notified only with notifyDone on, once', async () => {
+  for (const notifyDone of [false, true]) {
+    const fake = fakeCockpits({ 'a.example:4443': { projects: ['app'], runs: { app: [] } } })
+    const host = mockHost({ settings: { cockpits: 'https://a.example:4443', notifyDone } })
+    const worker = await mount(host)
+    await until(worker, (x) => Boolean(x.snapshot?.cockpits[0]?.streaming))
+    const run = { id: `ok-${notifyDone}`, title: 'gotowe', status: 'done', startedAt: now(), finishedAt: now() }
+    fake.push('a.example:4443', 'app', run)
+    await until(worker, (x) => Boolean(firstProject(x)?.finished?.length))
+    const end = Date.now() + (notifyDone ? 5000 : 600)
+    while (!host.callsOf('notifications.show').length && Date.now() < end) {
+      await settle(50)
+    }
+    fake.push('a.example:4443', 'app', run)
+    await settle()
+    const shown = host.callsOf('notifications.show') as { title: string }[]
+    assert.equal(shown.length, notifyDone ? 1 : 0)
+    if (notifyDone) {
+      assert.ok(shown[0].title.includes('zakończony'))
+    }
+    await worker.deactivate()
+  }
+})
+
+test('"explain" starts the agent in the workspace of the run repository, with the run in its prompt', async () => {
+  fakeCockpits({
+    'a.example:4443': {
+      projects: ['app'],
+      repos: { app: 'https://github.com/mercs600/orca-cezar-monitor' },
+      runs: { app: [{ id: 'r1', title: 'live', status: 'running', startedAt: now() }] }
+    }
+  })
+  // A throwaway checkout of the project: a Git folder whose `origin` is the repo above.
+  const { mkdtempSync } = await import('node:fs')
+  const { execFileSync } = await import('node:child_process')
+  const here = mkdtempSync(`${process.env.TMPDIR ?? '/tmp'}/cezar-ws-`)
+  execFileSync('git', ['init', '-q', here])
+  execFileSync('git', ['-C', here, 'remote', 'add', 'origin', 'git@github.com:mercs600/orca-cezar-monitor.git'])
+  const host = mockHost({
+    settings: { cockpits: 'https://a.example:4443 app', explainPrompt: '/cezar-skill explain {url} ({title})' },
+    secrets: { 'login:a.example': 'user', 'password:a.example': 'pw' },
+    results: {
+      'workspace.list': {
+        workspaces: [
+          { id: 'ws-tmp', kind: 'folder', name: 'tmp', path: '/', branch: null, hostId: null },
+          { id: 'ws-app', kind: 'folder', name: 'orca-cezar-monitor', path: here, branch: 'main', hostId: null }
+        ],
+        truncated: false
+      },
+      'agent.launch': { terminalId: 't1' },
+      'workspace.open': { opened: true }
+    }
+  })
+  const worker = await mount(host)
+  await until(worker, (x) => Boolean(firstProject(x)?.live[0]))
+  const url = 'https://a.example:4443/p/app/tasks/r1'
+  const out = (await worker.request('cezar.explain', { url, title: 'Fix login' })) as { workspace: string }
+  assert.equal(out.workspace, 'orca-cezar-monitor')
+  const { readFileSync } = await import('node:fs')
+  assert.deepEqual(readFileSync(cliLog, 'utf8').trim().split('\n'), [
+    'agent', 'launch', '--agent', 'claude', '--worktree', `path:${here}`,
+    '--prompt', `/cezar-skill explain ${url} (Fix login)`, '--focus', '--json'
+  ])
+  assert.equal(host.callsOf('agent.launch').length, 0, 'the CLI launched it')
+  await assert.rejects(worker.request('cezar.explain', { url: 'https://elsewhere/p/x/tasks/r9', title: 'x' }))
+  await worker.deactivate()
+})
+
+test('"explain" with no checkout of the project here opens in the focused workspace', async () => {
+  fakeCockpits({
+    'a.example:4443': {
+      projects: ['app'],
+      repos: { app: 'https://git.example.com/group/not-cloned' },
+      runs: { app: [{ id: 'r1', title: 'live', status: 'running', startedAt: now() }] }
+    }
+  })
+  const host = mockHost({
+    settings: { cockpits: 'https://a.example:4443 app' },
+    secrets: { 'login:a.example': 'user', 'password:a.example': 'pw' },
+    results: {
+      'workspace.list': {
+        workspaces: [
+          { id: 'ws-a', kind: 'folder', name: 'notes', path: '/', branch: null, hostId: null },
+          { id: 'ws-b', kind: 'worktree', name: 'shop', path: '/', branch: 'feat/x', hostId: null }
+        ],
+        truncated: false
+      },
+      'workspace.readContext': { branch: 'feat/x', displayName: 'shop', terminals: [] },
+      'agent.launch': { terminalId: 't1' },
+      'workspace.open': { opened: true }
+    }
+  })
+  const worker = await mount(host)
+  await until(worker, (x) => Boolean(firstProject(x)?.live[0]))
+  const url = 'https://a.example:4443/p/app/tasks/r1'
+  // A CLI that refuses (or times out) may have started the session already: no second launch.
+  process.env.FAKE_ORCA_FAIL = '1'
+  await assert.rejects(
+    worker.request('cezar.explain', { url, title: 'x' }).finally(() => delete process.env.FAKE_ORCA_FAIL),
+    /nope/
+  )
+  assert.equal(host.callsOf('agent.launch').length, 0)
+  // Without Orca's CLI: the plugin API's launch.
+  process.env.CEZAR_ORCA_CLI = '/nonexistent/orca'
+  const out = (await worker.request('cezar.explain', { url, title: 'x' }).finally(
+    () => (process.env.CEZAR_ORCA_CLI = fakeCli)
+  )) as { workspace: string }
+  assert.equal(out.workspace, 'shop')
+  assert.equal((host.callsOf('agent.launch')[0] as { workspaceId: string }).workspaceId, 'ws-b')
   await worker.deactivate()
 })

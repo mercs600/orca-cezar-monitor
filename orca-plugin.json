@@ -66,10 +66,34 @@
       },
       {
         "key": "notify",
-        "title": "Desktop notifications",
+        "title": "Notify about problems",
         "type": "boolean",
         "default": true,
         "description": "On a new failed run, a run asking a question, and a run held by an account usage limit."
+      },
+      {
+        "key": "notifyDone",
+        "title": "Notify when a run finishes",
+        "type": "boolean",
+        "default": false,
+        "description": "A desktop notification for every run that ends successfully, with its duration and merge request."
+      },
+      {
+        "key": "explainAgent",
+        "title": "Explain with agent",
+        "type": "string",
+        "default": "claude",
+        "placeholder": "claude",
+        "description": "The agent Orca starts when you press \"Explain\" on a run (claude, codex, ...). It opens in the workspace of the run's repository."
+      },
+      {
+        "key": "explainPrompt",
+        "title": "Explain prompt",
+        "type": "string",
+        "multiline": true,
+        "default": "",
+        "placeholder": "Explain what is happening with Cezar run {url} ...",
+        "description": "The prompt of an \"Explain\" session; empty = a built-in one, sent through the Cezar cockpit skill when you have one installed (~/.claude/skills, ~/.agents/skills, a Claude Code plugin) or the workspace has one (a skill with \"cezar\" in its name and \"cockpit\" in its name or description). {url}, {title}, {project}, {cockpit} and {run} are filled in; {title} comes from the issue, so anyone who files issues writes it."
       }
     ]
   },
@@ -85,6 +109,12 @@
     },
     {
       "kind": "notifications:show"
+    },
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "agent:launch"
     }
   ]
 }
